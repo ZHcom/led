@@ -1,0 +1,39 @@
+
+name: Build r4sGate Lotus (ESP32)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'main/**'
+      - 'CMakeLists.txt'
+      - 'sdkconfig*'
+      - 'partitions.csv'
+      - '.github/workflows/build-lotus.yml'
+
+jobs:
+  esp32:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Compile ESP32 OTA image with ESP-IDF 5.4.2
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.4.2
+          target: esp32
+          path: .
+          command: idf.py build
+
+      - name: Verify OTA image size
+        run: |
+          test -f build/r4sGate.bin
+          test "$(stat -c %s build/r4sGate.bin)" -le 1966080
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: r4sGate-Lotus-ESP32-OTA
+          path: build/r4sGate.bin
+          if-no-files-found: error
