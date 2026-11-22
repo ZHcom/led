@@ -1,3 +1,33 @@
-idf_component_register(SRCS "r4sGate.c" "lotus_protocol.c" "lotus_ha.c" "lotus_bridge.c"
-                    INCLUDE_DIRS "."
-                    REQUIRES bt mqtt json nvs_flash esp_timer esp_http_server)
+
+idf_component_register(
+    SRCS
+        "r4sGate.c"
+        "lotus_protocol.c"
+        "lotus_ha.c"
+        "lotus_bridge.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        bt
+        mqtt
+        json
+        nvs_flash
+        esp_timer
+        esp_http_server
+        spi_flash
+        app_update
+        esp_http_client
+        esp-tls
+        mbedtls
+        esp_phy
+        esp_wifi
+        esp_netif
+        esp_event
+        lwip
+        driver
+        esp_driver_gptimer
+        esp_driver_ledc
+        esp_driver_spi
+        esp_driver_gpio
+        esp_driver_i2c
+        esp_driver_uart
+)
