@@ -13591,6 +13591,7 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
                                                 ESP_BLE_AD_TYPE_NAME_CMPL, &adv_name_len);
 	memset(devname,0,32);
 	if (adv_name_len && (adv_name_len < 32)) memcpy(devname,adv_name, adv_name_len);
+	lotus_scan_candidate(scan_result->scan_rst.bda,devname,scan_result->scan_rst.rssi);
 
 	if (fdebug) {
 //	ESP_LOGI(AP_TAG, "Adv Data Len %d, Scan Response Len %d", scan_result->scan_rst.adv_data_len, scan_result->scan_rst.scan_rsp_len);
@@ -34040,6 +34041,13 @@ static const httpd_uri_t lotus_page = {
 static const httpd_uri_t lotus_save_page = {
     .uri="/lotus/save", .method=HTTP_POST, .handler=lotus_post_handler
 };
+static esp_err_t lotus_command_handler(httpd_req_t *req) {
+    if (!test_auth(req)) return ESP_OK;
+    return lotus_http_command(req);
+}
+static const httpd_uri_t lotus_command_page = {
+    .uri="/lotus/control", .method=HTTP_POST, .handler=lotus_command_handler
+};
 
 //*************************************************
 
@@ -34092,6 +34100,7 @@ static httpd_handle_t start_webserver(void)
 	httpd_register_uri_handler(server, &pfavicon);
 	httpd_register_uri_handler(server, &lotus_page);
 	httpd_register_uri_handler(server, &lotus_save_page);
+	httpd_register_uri_handler(server, &lotus_command_page);
 	return server;
 	}
 	if (fdebug) ESP_LOGI(AP_TAG, "Error starting server!");

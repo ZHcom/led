@@ -31,7 +31,7 @@ bool lotus_ha_discovery(const lotus_manager_t *manager, size_t index,
     const lotus_light_t *light = &manager->light[index];
     char mac[13], name[32], unique_id[48], command_topic[128], state_topic[128];
     lotus_mac_compact(light->mac, mac);
-    snprintf(name, sizeof(name), "Lotus %u", (unsigned)(index + 1));
+    snprintf(name, sizeof(name), "%s", light->name[0] ? light->name : "Lotus");
     snprintf(unique_id, sizeof(unique_id), "r4sgate_lotus_%s", mac);
     int count = snprintf(topic, topic_len, "homeassistant/light/%s/config", unique_id);
     if (count < 0 || (size_t)count >= topic_len) return false;
@@ -44,6 +44,11 @@ bool lotus_ha_discovery(const lotus_manager_t *manager, size_t index,
     set_text(root, "schema", "json");
     set_text(root, "command_topic", command_topic);
     set_text(root, "state_topic", state_topic);
+    char availability_topic[128];
+    snprintf(availability_topic,sizeof(availability_topic),"%s/lotus/availability",gateway_prefix);
+    set_text(root,"availability_topic",availability_topic);
+    set_text(root,"payload_available","online");
+    set_text(root,"payload_not_available","offline");
     cJSON *modes = cJSON_AddArrayToObject(root, "supported_color_modes");
     if (modes) cJSON_AddItemToArray(modes, cJSON_CreateString("rgb"));
     cJSON *device = cJSON_AddObjectToObject(root, "device");
@@ -54,7 +59,7 @@ bool lotus_ha_discovery(const lotus_manager_t *manager, size_t index,
         if (ids) cJSON_AddItemToArray(ids,cJSON_CreateString(device_id));
         set_text(device,"name",name);
         set_text(device,"manufacturer","Lotus Lantern / ELK");
-        set_text(device,"model","ELK-BLEDOM (protocol pending second-device validation)");
+        set_text(device,"model","ELK-BLEDOM (FFF0/FFF3)");
     }
     bool ok = print_json(root, json, json_len);
     cJSON_Delete(root);
@@ -88,19 +93,20 @@ bool lotus_ha_parse_command(lotus_manager_t *manager,
     cJSON *brightness = cJSON_GetObjectItemCaseSensitive(root,"brightness");
     cJSON *color = cJSON_GetObjectItemCaseSensitive(root,"color");
     bool accepted = false;
+    bool power_off = false;
     if (cJSON_IsString(state)) {
         if (strcmp(state->valuestring,"ON")==0) {
             lotus_manager_power(manager,matched_index,true); accepted=true;
         } else if (strcmp(state->valuestring,"OFF")==0) {
-            lotus_manager_power(manager,matched_index,false); accepted=true;
+            lotus_manager_power(manager,matched_index,false); accepted=true; power_off=true;
         }
     }
-    if (is_valid_number(brightness)) {
+    if (!power_off && is_valid_number(brightness)) {
         uint8_t value=(uint8_t)brightness->valueint;
         lotus_manager_brightness(manager,matched_index,lotus_ha_brightness_to_percent(value));
         accepted=true;
     }
-    if (cJSON_IsObject(color)) {
+    if (!power_off && cJSON_IsObject(color)) {
         const cJSON *r=cJSON_GetObjectItemCaseSensitive(color,"r");
         const cJSON *g=cJSON_GetObjectItemCaseSensitive(color,"g");
         const cJSON *b=cJSON_GetObjectItemCaseSensitive(color,"b");

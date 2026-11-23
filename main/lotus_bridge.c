@@ -9,6 +9,7 @@
 #include "lotus_ha.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <inttypes.h>
 #include <string.h>
 #include <strings.h>
@@ -32,6 +33,10 @@
 #define LOTUS_ADV_MAX_AGE_MS 30000
 #define LOTUS_TRIAL_MS 120000
 #define LOTUS_EVENT_QUEUE_LEN 16
+#define LOTUS_SCAN_CANDIDATES 10
+#define LOTUS_MAX_WEB_FORM 700
+#define LOTUS_RETRY_MIN_MS 4000
+#define LOTUS_RETRY_MAX_MS 60000
 
 /* v3: crash breadcrumbs in RTC no-init RAM. No flash write for each event.
  * RTC memory is normally retained across SW/PANIC resets but not power loss.
@@ -153,6 +158,12 @@ static int64_t last_diagnostics_ms;
 static esp_gatt_if_t client_if=ESP_GATT_IF_NONE;
 static esp_mqtt_client_handle_t mqtt;
 static char base_topic[32];
+/* Retained MQTT availability is published outside the MQTT event callback.
+ * OFF = unavailable in HA, even if the discovery config is retained. */
+static esp_mqtt_client_handle_t availability_client;
+static char availability_topic[112];
+static volatile bool availability_pending;
+static int64_t availability_retry_ms;
 /* Publish MQTT Discovery from the r4sGate main loop, NOT the MQTT callback.
  * Static scratch buffers protect the 4.4 kB ESP32 main-task stack. */
 static unsigned discovery_cursor;
@@ -162,6 +173,20 @@ static char discovery_json[1000];
 static char discovery_cmd[100];
 static uint8_t bt_type[LOTUS_MAX_LIGHTS];
 static bool seen[LOTUS_MAX_LIGHTS];
+/* PASSIVE advertising observations: available even if Lotus control is OFF.
+   Do not allocate in the Bluedroid GAP callback or create a second scanner. */
+typedef struct {
+    uint8_t mac[6];
+    char name[18];
+    int rssi;
+    int64_t at_ms;
+    bool used;
+} lotus_candidate_t;
+static lotus_candidate_t candidates[LOTUS_SCAN_CANDIDATES];
+static portMUX_TYPE candidate_mux=portMUX_INITIALIZER_UNLOCKED;
+static uint8_t retry_count[LOTUS_MAX_LIGHTS];
+static uint32_t queued_writes[LOTUS_MAX_LIGHTS];
+static int64_t last_write_ms[LOTUS_MAX_LIGHTS];
 static int rssi_values[LOTUS_MAX_LIGHTS];
 static int64_t last_seen[LOTUS_MAX_LIGHTS];
 static int64_t retry_after[LOTUS_MAX_LIGHTS];
@@ -185,16 +210,28 @@ static bool any_pending(int i) {
 }
 static int next_pending(void) {
     int64_t now=now_ms();
-    for(int i=0;i<(int)LOTUS_MAX_LIGHTS;i++)
+    for(int step=0;step<(int)LOTUS_MAX_LIGHTS;step++) {
+        int i=((int)manager.round_robin+step)%(int)LOTUS_MAX_LIGHTS;
         if(any_pending(i) && seen[i] && now-last_seen[i]<LOTUS_ADV_MAX_AGE_MS && now>=retry_after[i])return i;
+    }
     return -1;
 }
 static void reset_connection(void) {
     link_state=L_IDLE; active=-1; connection_id=0;
     start_handle=end_handle=write_handle=0; link_since=0; last_tx=0;
 }
+static void mark_retry(int slot) {
+    if(slot<0 || slot>=(int)LOTUS_MAX_LIGHTS) return;
+    unsigned count=retry_count[slot];
+    if(count<5) retry_count[slot]++;
+    uint32_t pause=LOTUS_RETRY_MIN_MS;
+    for(unsigned i=0;i<count && pause<LOTUS_RETRY_MAX_MS/2;i++) pause*=2;
+    if(pause>LOTUS_RETRY_MAX_MS)pause=LOTUS_RETRY_MAX_MS;
+    retry_after[slot]=now_ms()+pause;
+    lotus_diag_event("BLE retry scheduled",slot+1,(int)pause);
+}
 static void fail_connection(void) {
-    if(active>=0 && active<(int)LOTUS_MAX_LIGHTS)retry_after[active]=now_ms()+5000;
+    mark_retry(active);
     reset_connection();
 }
 static void begin_open(void) {
@@ -235,10 +272,15 @@ void lotus_init(void) {
     discovery_cursor=LOTUS_MAX_LIGHTS;
     next_discovery_ms=0;
     memset(&manager,0,sizeof(manager));
+    memset(retry_count,0,sizeof(retry_count));
+    memset(retry_after,0,sizeof(retry_after));
+    memset(queued_writes,0,sizeof(queued_writes));
+    memset(last_write_ms,0,sizeof(last_write_ms));
     manager.count=LOTUS_MAX_LIGHTS;
     for(int i=0;i<(int)LOTUS_MAX_LIGHTS;i++){
         manager.light[i].r=manager.light[i].g=manager.light[i].b=255;
         manager.light[i].brightness=100;
+        snprintf(manager.light[i].name,sizeof(manager.light[i].name),"Lotus %d",i+1);
     }
     nvs_handle_t h;
     if(nvs_open("lotus",NVS_READWRITE,&h)==ESP_OK){
@@ -248,6 +290,19 @@ void lotus_init(void) {
         uint8_t always=0, trial=0, initialized=0;
         nvs_get_u8(h,"mode",&always);
         nvs_get_u8(h,"trial",&trial);
+        /* Fail safe on an unexpected reboot in persistent mode: never
+         * boot-loop the ESP32 and interrupt the four PVVX thermometers. */
+        esp_reset_reason_t reason=esp_reset_reason();
+        bool unsafe_reset=(reason==ESP_RST_PANIC || reason==ESP_RST_WDT ||
+                           reason==ESP_RST_TASK_WDT || reason==ESP_RST_INT_WDT ||
+                           reason==ESP_RST_BROWNOUT);
+        if(always && unsafe_reset) {
+            lotus_diag_event("Unsafe reset, Lotus OFF",(int)reason,0);
+            always=0;trial=0;
+            nvs_set_u8(h,"mode",0);
+            nvs_set_u8(h,"trial",0);
+            nvs_commit(h);
+        }
         if(trial){
             lotus_diag_event("Trial flag found",1,0);
             nvs_set_u8(h,"trial",0);
@@ -270,12 +325,16 @@ void lotus_init(void) {
             nvs_commit(h);
         }
         for(int i=0;i<(int)LOTUS_MAX_LIGHTS;i++){
-            char key[8],s[24]={0};size_t len=sizeof(s);uint8_t mac[6];
-            snprintf(key,sizeof(key),"mac%d",i);
+            char key[8]="mac0",s[24]={0};size_t len=sizeof(s);uint8_t mac[6];
+            key[3]=(char)('0'+i);
             if(nvs_get_str(h,key,s,&len)==ESP_OK && lotus_parse_mac(s,mac)){
                 memcpy(manager.light[i].mac,mac,6);
                 manager.light[i].enabled=true;
             }
+            memcpy(key,"nm0",4);key[2]=(char)('0'+i);
+            char label[32]={0};size_t label_len=sizeof(label);
+            if(nvs_get_str(h,key,label,&label_len)==ESP_OK && label[0])
+                snprintf(manager.light[i].name,sizeof(manager.light[i].name),"%s",label);
         }
         nvs_close(h);
     }
@@ -293,6 +352,30 @@ void lotus_init(void) {
     }
     lotus_diag_event("Init complete",enabled,trial_mode);
     ESP_LOGI(TAG,"Lotus manager ready; enabled=%d trial=%d; 5 slots; shared passive scan",enabled,trial_mode);
+}
+void lotus_scan_candidate(const uint8_t mac[6], const char *adv_name, int rssi) {
+    if(!mac || !adv_name) return;
+    /* Record only ELK controllers. Other manufacturers use different GATT
+       formats; sightings are shown, but never auto-enabled or connected. */
+    if(strncmp(adv_name,"ELK-BLEDOM",10)!=0 &&
+       strncmp(adv_name,"ELK-BLEDDM",10)!=0) return;
+    int64_t stamp=now_ms();
+    portENTER_CRITICAL(&candidate_mux);
+    int target=-1, oldest=0;
+    for(int i=0;i<LOTUS_SCAN_CANDIDATES;i++) {
+        if(candidates[i].used && !memcmp(candidates[i].mac,mac,6)) {target=i;break;}
+        if(!candidates[i].used && target<0)target=i;
+        if(candidates[i].at_ms<candidates[oldest].at_ms) oldest=i;
+    }
+    if(target<0) target=oldest;
+    lotus_candidate_t *c=&candidates[target];
+    memcpy(c->mac,mac,6);
+    /* Constant fixed strings, no string manipulation in the critical part. */
+    const char *type=strncmp(adv_name,"ELK-BLEDDM",10)==0?"ELK-BLEDDM":"ELK-BLEDOM";
+    memcpy(c->name,type,11);
+    c->name[10]=0;
+    c->rssi=rssi;c->at_ms=stamp;c->used=true;
+    portEXIT_CRITICAL(&candidate_mux);
 }
 void lotus_scan_seen(const uint8_t mac[6], esp_ble_addr_type_t type, int rssi){
     if(!enabled || !mac || !mutex)return;
@@ -314,6 +397,15 @@ static void lotus_process_gatt_event(esp_gattc_cb_event_t event,esp_gatt_if_t in
 
 void lotus_tick(bool scanning,bool *scan_stop_req,bool setting_scan,
                 bool ota_active,bool other_ble_busy) {
+    if(!ota_active && availability_pending && availability_client &&
+       now_ms()>=availability_retry_ms) {
+        esp_mqtt_client_handle_t c=availability_client;
+        int rc=esp_mqtt_client_publish(c,availability_topic,
+                                       enabled?"online":"offline",0,1,1);
+        availability_pending=rc<0;
+        availability_retry_ms=now_ms()+3000;
+        lotus_diag_event("MQTT availability",enabled,rc>=0);
+    }
     if(!enabled || !mutex || !gatt_events || ota_active)return;
     take();
     /* BLE events are applied only here, outside Bluedroid callback context. */
@@ -402,6 +494,8 @@ void lotus_tick(bool scanning,bool *scan_stop_req,bool setting_scan,
                     lotus_diag_event("GATT write queued",active+1,(int)action);
                     lotus_manager_ack_action(&manager,(size_t)active,action);
                     publish_pending[active]=true;have_state[active]=true;
+                    queued_writes[active]++;
+                    last_write_ms[active]=now;
                     last_tx=now;
                 }else{
                     lotus_diag_event("GATT write refused",(int)err,active+1);
@@ -427,7 +521,7 @@ void lotus_tick(bool scanning,bool *scan_stop_req,bool setting_scan,
             lotus_diag_event("Stop event missing",(int)scanning,active+1);
         }
         if(link_state==L_DISCOVERING||link_state==L_READY) {
-            if(active>=0)retry_after[active]=now+5000;
+            mark_retry(active);
             close_connection();
         } else if(link_state==L_OPENING) {
             /* Legacy gattc_open has no compatible cancellation on IDF 5.4;
@@ -540,6 +634,7 @@ static void lotus_process_gatt_event(esp_gattc_cb_event_t event,esp_gatt_if_t in
             ESP_LOGW(TAG,"Open failed %d",p->open.status);fail_connection();break;
         }
         lotus_diag_event("GATT open OK",active+1,(int)p->open.conn_id);
+        retry_count[active]=0;retry_after[active]=0;
         connection_id=p->open.conn_id;link_state=L_DISCOVERING;link_since=now_ms();
         lotus_diag_event("Discover service start",(int)connection_id,0);
         if(esp_ble_gattc_send_mtu_req(client_if,connection_id)!=ESP_OK){
@@ -577,7 +672,7 @@ static void lotus_process_gatt_event(esp_gattc_cb_event_t event,esp_gatt_if_t in
             }else{
                 lotus_diag_event("FFF3 NOT FOUND",(int)p->search_cmpl.status,0);
                 ESP_LOGW(TAG,"FFF0/FFF3 write-no-response not found");
-                if(active>=0)retry_after[active]=now_ms()+10000;
+                mark_retry(active);
                 close_connection();
             }
         }
@@ -591,6 +686,7 @@ static void lotus_process_gatt_event(esp_gattc_cb_event_t event,esp_gatt_if_t in
     case ESP_GATTC_DISCONNECT_EVT:
         if(active>=0 && !memcmp(p->disconnect.remote_bda,manager.light[active].mac,6)){
             lotus_diag_event("GATT disconnected",(int)p->disconnect.reason,active+1);
+            if(p->disconnect.reason!=0x16 && any_pending(active))mark_retry(active);
             reset_connection();
         }
         break;
@@ -599,7 +695,12 @@ static void lotus_process_gatt_event(esp_gattc_cb_event_t event,esp_gatt_if_t in
 }
 
 void lotus_mqtt_connected(esp_mqtt_client_handle_t client,const char *prefix){
-    if(!enabled || !client || !prefix)return;
+    if(!client || !prefix)return;
+    availability_client=client;
+    snprintf(availability_topic,sizeof(availability_topic),"%s/lotus/availability",prefix);
+    availability_pending=true;
+    availability_retry_ms=0;
+    if(!enabled)return;
     /* Publish/subscribe belongs in lotus_tick(), never the MQTT callback.
      * This also leaves clear RTC breadcrumbs at the next main-loop tick. */
     take();
@@ -611,6 +712,8 @@ void lotus_mqtt_connected(esp_mqtt_client_handle_t client,const char *prefix){
     lotus_diag_event("MQTT session queued",0,0);
 }
 void lotus_mqtt_disconnected(void){
+    availability_client=NULL;
+    availability_pending=false;
     take();mqtt=NULL;give();
 }
 bool lotus_mqtt_message(const char *topic,int topic_len,const char *payload,int payload_len,const char *prefix){
@@ -632,6 +735,35 @@ static void mac_text(int slot,char out[18]){
     const uint8_t *m=manager.light[slot].mac;
     snprintf(out,18,"%02X:%02X:%02X:%02X:%02X:%02X",m[0],m[1],m[2],m[3],m[4],m[5]);
 }
+/* Escape labels before reflecting UTF-8 user names in HTML attributes. */
+static void html_escape(const char *src,char *dst,size_t cap) {
+    size_t pos=0;
+    while(*src && pos+7<cap) {
+        const char *replace=NULL;
+        switch(*src) {
+            case '&':replace="&amp;";break;
+            case '<':replace="&lt;";break;
+            case '>':replace="&gt;";break;
+            case '"':replace="&quot;";break;
+            case '\'':replace="&#39;";break;
+        }
+        if(replace) {size_t n=strlen(replace);memcpy(dst+pos,replace,n);pos+=n;}
+        else {dst[pos++]=*src;}
+        src++;
+    }
+    dst[pos]=0;
+}
+static bool valid_label(const char *s) {
+    size_t n=strlen(s);
+    if(n>=sizeof(manager.light[0].name))return false;
+    for(size_t i=0;i<n;i++)if((unsigned char)s[i]<0x20 || s[i]==0x7f)return false;
+    return true;
+}
+static void copy_candidates(lotus_candidate_t out[LOTUS_SCAN_CANDIDATES]) {
+    portENTER_CRITICAL(&candidate_mux);
+    memcpy(out,candidates,sizeof(candidates));
+    portEXIT_CRITICAL(&candidate_mux);
+}
 esp_err_t lotus_http_get(httpd_req_t *req){
     char query[64]={0};
     if(httpd_req_get_url_query_str(req,query,sizeof(query))==ESP_OK && strstr(query,"log=1")) {
@@ -641,12 +773,23 @@ esp_err_t lotus_http_get(httpd_req_t *req){
         return httpd_resp_sendstr_chunk(req,NULL);
     }
     char macs[LOTUS_MAX_LIGHTS][18];
+    char names[LOTUS_MAX_LIGHTS][32];
+    uint32_t writes[LOTUS_MAX_LIGHTS];
+    uint8_t reds[LOTUS_MAX_LIGHTS],greens[LOTUS_MAX_LIGHTS],blues[LOTUS_MAX_LIGHTS],levels[LOTUS_MAX_LIGHTS];
+    int64_t wait_ms[LOTUS_MAX_LIGHTS];
+    bool pending[LOTUS_MAX_LIGHTS];
     int rssis[LOTUS_MAX_LIGHTS];
     int64_t ages[LOTUS_MAX_LIGHTS];
     int64_t tm=now_ms();
     take();
     for(int i=0;i<(int)LOTUS_MAX_LIGHTS;i++){
         mac_text(i,macs[i]);
+        snprintf(names[i],sizeof(names[i]),"%s",manager.light[i].name);
+        reds[i]=manager.light[i].r; greens[i]=manager.light[i].g;
+        blues[i]=manager.light[i].b; levels[i]=manager.light[i].brightness;
+        writes[i]=queued_writes[i];
+        wait_ms[i]=retry_after[i]>tm?retry_after[i]-tm:0;
+        pending[i]=any_pending(i);
         rssis[i]=rssi_values[i];
         ages[i]=seen[i]?((tm-last_seen[i])/1000):-1;
     }
@@ -655,7 +798,7 @@ esp_err_t lotus_http_get(httpd_req_t *req){
     give();
     httpd_resp_set_type(req,"text/html; charset=utf-8");
     httpd_resp_set_hdr(req,"Cache-Control","no-store, no-cache, must-revalidate");
-    httpd_resp_sendstr_chunk(req,"<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Lotus Lantern v5</title><style>body{font:16px system-ui;background:#161b22;color:#e6edf3;max-width:760px;margin:25px auto;padding:12px}input,select{font-size:1rem;padding:12px;background:#fff;border:0;border-radius:7px;max-width:230px}label{display:block;margin:18px 0}button{background:#238636;color:#fff;border:0;border-radius:7px;padding:12px 20px}a{color:#58a6ff}.warn{color:#ffb86c}</style></head><body><h1>Lotus Lantern v5</h1><p>Five BLE strip slots. Thermometers use the original scanner. BLE control is <b>OFF by default</b>.</p>");
+    httpd_resp_sendstr_chunk(req,"<!doctype html><html lang='ru'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Lotus Lantern v7</title><style>body{font:16px system-ui;background:#161b22;color:#e6edf3;max-width:790px;margin:25px auto;padding:12px}input,select{font-size:1rem;padding:9px;background:#fff;color:#111;border:0;border-radius:7px;max-width:230px}input[type=color]{height:46px;width:75px}input[type=range]{width:185px}label{display:block;margin:13px 0}button{background:#238636;color:#fff;border:0;border-radius:7px;padding:10px 16px;margin:4px;cursor:pointer}button.secondary{background:#36415a}a{color:#58a6ff}.warn{color:#ffb86c}.card{border:1px solid #36415a;border-radius:12px;margin:13px 0;padding:14px}.detail{color:#a6b3c3;font-size:13px}h3{margin:4px 0}</style></head><body><h1>Lotus Lantern v7</h1><p>До пяти независимых ELK-BLEDOM. Датчики ATC/PVVX работают через существующий BLE-сканер. Не проверяйте неизвестные модели без подтверждения протокола.</p>");
     char status[240];
     snprintf(status,sizeof(status),"<p><b>Status: %s</b>%s%lld%s. Free heap: %"PRIu32" bytes.</p>",
              active?(is_trial?"TRIAL":"ENABLED"):"DISABLED",
@@ -664,9 +807,11 @@ esp_err_t lotus_http_get(httpd_req_t *req){
     httpd_resp_sendstr_chunk(req,status);
     httpd_resp_sendstr_chunk(req,"<form action='/lotus/save' method='POST'>");
     for(int i=0;i<(int)LOTUS_MAX_LIGHTS;i++){
-        char b[256];
-        snprintf(b,sizeof(b),"<label>LED strip %d (MAC): <input name='mac%d' maxlength='17' placeholder='BE:37:FA:00:7F:F2' value='%s'></label><small>RSSI: %d dBm; seen %lld seconds ago</small>",
-                 i+1,i,macs[i],rssis[i],(long long)ages[i]);
+        static char b[768]; /* HTTP server has a limited task stack. */
+        char safe[160];
+        html_escape(names[i],safe,sizeof(safe));
+        snprintf(b,sizeof(b),"<div class='card'><h3>Лента %d</h3><label>Название: <input name='nm%d' maxlength='31' value=\"%s\"></label><label>MAC: <input id='mac%d' name='mac%d' maxlength='17' placeholder='BE:37:FA:00:7F:F2' value='%s'></label><span class='detail'>RSSI %d dBm; последнее обнаружение %lld с назад</span></div>",
+                 i+1,i,safe,i,i,macs[i],rssis[i],(long long)ages[i]);
         httpd_resp_sendstr_chunk(req,b);
     }
     httpd_resp_sendstr_chunk(req,"<p>Unknown ELK-BLEDDM protocol has not been verified. Leave its MAC empty.</p><label>Mode: <select name='mode'>");
@@ -674,7 +819,30 @@ esp_err_t lotus_http_get(httpd_req_t *req){
             "<option value='off'>OFF (safest)</option><option value='trial' selected>TEST for 2 minutes</option><option value='on'>ALWAYS ON</option>" :
             "<option value='off'>OFF (safest)</option><option value='trial'>TEST for 2 minutes</option><option value='on' selected>ALWAYS ON</option>") :
             "<option value='off' selected>OFF (safest)</option><option value='trial'>TEST for 2 minutes</option><option value='on'>ALWAYS ON</option>");
-    httpd_resp_sendstr_chunk(req,"</select></label><p class='warn'>Test mode is disarmed BEFORE BLE starts. A crash or reset will return to OFF. All save operations restart the ESP32.</p><button type='submit'>Save and reboot</button></form>");
+    httpd_resp_sendstr_chunk(req,"</select></label><p class='warn'>При TEST ESP32 автоматически вернётся в OFF после 2 минут. После Panic в ALWAYS ON модуль Lotus отключится при следующем запуске.</p><button type='submit'>Сохранить настройки и перезагрузить</button></form>");
+    httpd_resp_sendstr_chunk(req,"<h2>Обнаруженные контроллеры ELK</h2><p class='detail'>Нажмите «Добавить», затем сохраните настройки выше. ELK-BLEDDM может использовать другой протокол и здесь не проверен.</p>");
+    lotus_candidate_t recent[LOTUS_SCAN_CANDIDATES];copy_candidates(recent);
+    int shown=0;
+    for(int i=0;i<LOTUS_SCAN_CANDIDATES;i++){
+        if(!recent[i].used || tm-recent[i].at_ms>120000)continue;
+        const uint8_t *m=recent[i].mac;
+        char b[320];
+        snprintf(b,sizeof(b),"<div class='card'><b>%s</b> — %02X:%02X:%02X:%02X:%02X:%02X <span class='detail'>(%d dBm)</span><button class='secondary' type='button' onclick=\"addMac('%02X:%02X:%02X:%02X:%02X:%02X')\">Добавить</button></div>",
+           recent[i].name,m[0],m[1],m[2],m[3],m[4],m[5],recent[i].rssi,m[0],m[1],m[2],m[3],m[4],m[5]);
+        httpd_resp_sendstr_chunk(req,b);shown++;
+    }
+    if(!shown)httpd_resp_sendstr_chunk(req,"<p class='detail'>Пока не обнаружены (проверьте, что BLE Monitor сканирует).</p>");
+    httpd_resp_sendstr_chunk(req,"<script>function addMac(mac){for(let i=0;i<5;i++){let e=document.getElementById('mac'+i);if(e&&(!e.value||e.value.toUpperCase()===mac.toUpperCase())){e.value=mac;e.focus();return}}alert('Все пять слотов заняты')}</script>");
+    httpd_resp_sendstr_chunk(req,"<h2>Управление лентами</h2><p class='detail'>Команды доступны только в TEST / ALWAYS ON. Счётчик показывает поставленные в очередь BLE-записи, а не подтверждение от ленты.</p>");
+    for(int i=0;i<(int)LOTUS_MAX_LIGHTS;i++){
+        if(!macs[i][0])continue;
+        static char b[960];
+        char name_safe[160];
+        html_escape(names[i],name_safe,sizeof(name_safe));
+        snprintf(b,sizeof(b),"<div class='card'><h3>%s</h3><p class='detail'>%s | %s | записей в BLE: %"PRIu32" | ожидание: %lld с</p><form method='post' action='/lotus/control'><input type='hidden' name='slot' value='%d'><button name='action' value='on'>Включить</button><button name='action' value='off' class='secondary'>Выключить</button><p><label>Цвет <input type='color' name='color' value='#%02X%02X%02X'><button name='action' value='color'>Применить RGB</button></label></p><p><label>Яркость <input type='range' min='1' max='100' name='brightness' value='%u'><button name='action' value='brightness'>Применить</button></label></p></form></div>",
+            name_safe,macs[i],pending[i]?"команды ожидают":"очередь пуста",writes[i],(long long)(wait_ms[i]/1000),i,reds[i],greens[i],blues[i],levels[i]);
+        httpd_resp_sendstr_chunk(req,b);
+    }
     lotus_diag_render(req,true);
     httpd_resp_sendstr_chunk(req,"<p><a href='/'>Back to r4sGate</a></p></body></html>");
     return httpd_resp_sendstr_chunk(req,NULL);
@@ -689,14 +857,16 @@ static void decode_form_value(const char *v,size_t n,char *out,size_t cap){
     out[j]=0;
 }
 esp_err_t lotus_http_post(httpd_req_t *req){
-    if(req->content_len<=0 || req->content_len>256){httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Invalid form size");return ESP_FAIL;}
-    char form[257]={0};int pos=0;
+    if(req->content_len<=0 || req->content_len>LOTUS_MAX_WEB_FORM){httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Invalid form size");return ESP_FAIL;}
+    char form[LOTUS_MAX_WEB_FORM+1]={0};int pos=0;
     while(pos<req->content_len){
         int n=httpd_req_recv(req,form+pos,req->content_len-pos);
         if(n<=0){httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Incomplete form");return ESP_FAIL;}
         pos+=n;
     }
     char macs[LOTUS_MAX_LIGHTS][18]={{0}};
+    char names[LOTUS_MAX_LIGHTS][32]={{0}};
+    bool has_name[LOTUS_MAX_LIGHTS]={0};
     char mode[8]={0};
     bool mode_field=false;
     bool fields[LOTUS_MAX_LIGHTS]={0};
@@ -705,6 +875,12 @@ esp_err_t lotus_http_post(httpd_req_t *req){
         if(!strncmp(part,"mode=",5)){
             decode_form_value(part+5,strlen(part+5),mode,sizeof(mode));
             mode_field=true;
+            continue;
+        }
+        if(!strncmp(part,"nm",2) && part[2]>='0' && part[2]<='4' && part[3]=='=') {
+            int index=part[2]-'0';
+            decode_form_value(part+4,strlen(part+4),names[index],sizeof(names[index]));
+            has_name[index]=true;
             continue;
         }
         if(strncmp(part,"mac",3)||part[3]<'0'||part[3]>'4'||part[4]!='=')continue;
@@ -716,7 +892,8 @@ esp_err_t lotus_http_post(httpd_req_t *req){
         httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Invalid mode");return ESP_FAIL;
     }
     for(int i=0;i<(int)LOTUS_MAX_LIGHTS;i++){
-        if(!fields[i] || (macs[i][0] && !lotus_parse_mac(macs[i],(uint8_t[6]){0}))){
+        if(!fields[i] || !has_name[i] || !valid_label(names[i]) ||
+           (macs[i][0] && !lotus_parse_mac(macs[i],(uint8_t[6]){0}))){
             httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Invalid MAC address");return ESP_FAIL;
         }
         for(int j=0;j<i;j++)if(macs[i][0] && macs[j][0] && !strcasecmp(macs[i],macs[j])){
@@ -727,8 +904,10 @@ esp_err_t lotus_http_post(httpd_req_t *req){
     if(nvs_open("lotus",NVS_READWRITE,&h)!=ESP_OK){httpd_resp_send_err(req,HTTPD_500_INTERNAL_SERVER_ERROR,"NVS unavailable");return ESP_FAIL;}
     esp_err_t ret=ESP_OK;
     for(int i=0;i<(int)LOTUS_MAX_LIGHTS;i++){
-        char key[8];snprintf(key,sizeof(key),"mac%d",i);
+        char key[8]="mac0";key[3]=(char)('0'+i);
         if(nvs_set_str(h,key,macs[i])!=ESP_OK)ret=ESP_FAIL;
+        memcpy(key,"nm0",4);key[2]=(char)('0'+i);
+        if(nvs_set_str(h,key,names[i])!=ESP_OK)ret=ESP_FAIL;
     }
     if(ret==ESP_OK && nvs_set_u8(h,"mode",!strcmp(mode,"on")?1:0)!=ESP_OK)ret=ESP_FAIL;
     if(ret==ESP_OK && nvs_set_u8(h,"trial",!strcmp(mode,"trial")?1:0)!=ESP_OK)ret=ESP_FAIL;
@@ -741,6 +920,62 @@ esp_err_t lotus_http_post(httpd_req_t *req){
     httpd_resp_send(req,NULL,0);
     restart_at=now_ms()+2000;restart_requested=true;
     return ESP_OK;
+}
+esp_err_t lotus_http_command(httpd_req_t *req) {
+    /* No configuration/NVS changes: just queue a command for the main loop. */
+    if(!enabled || !mutex){
+        httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Lotus is OFF. Enable TEST or ALWAYS ON first.");
+        return ESP_FAIL;
+    }
+    if(req->content_len<=0 || req->content_len>160){
+        httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Invalid command size");return ESP_FAIL;
+    }
+    char form[161]={0}, action[24]={0}, color[16]={0};
+    int read=0,slot=-1,brightness=-1;
+    while(read<req->content_len){
+        int n=httpd_req_recv(req,form+read,req->content_len-read);
+        if(n<=0){httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Incomplete command");return ESP_FAIL;}
+        read+=n;
+    }
+    char *save=NULL;
+    for(char *part=strtok_r(form,"&",&save);part;part=strtok_r(NULL,"&",&save)){
+        if(!strncmp(part,"slot=",5)){
+            if(strlen(part+5)==1 && part[5]>='0' && part[5]<='4')slot=part[5]-'0';
+        }else if(!strncmp(part,"action=",7)){
+            decode_form_value(part+7,strlen(part+7),action,sizeof(action));
+        }else if(!strncmp(part,"color=",6)){
+            decode_form_value(part+6,strlen(part+6),color,sizeof(color));
+        }else if(!strncmp(part,"brightness=",11)){
+            char val[8]={0};decode_form_value(part+11,strlen(part+11),val,sizeof(val));
+            if(strlen(val)<=3 && strspn(val,"0123456789")==strlen(val) && val[0])brightness=atoi(val);
+        }
+    }
+    if(slot<0 || slot>=(int)LOTUS_MAX_LIGHTS){httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Invalid slot");return ESP_FAIL;}
+    bool ok=false;
+    take();
+    if(manager.light[slot].enabled){
+        if(!strcmp(action,"on"))ok=lotus_manager_power(&manager,slot,true);
+        else if(!strcmp(action,"off"))ok=lotus_manager_power(&manager,slot,false);
+        else if(!strcmp(action,"brightness") && brightness>=1 && brightness<=100){
+            ok=lotus_manager_brightness(&manager,slot,(uint8_t)brightness);
+            if(!manager.light[slot].power)lotus_manager_power(&manager,slot,true);
+        } else if(!strcmp(action,"color") && color[0]=='#' && strlen(color)==7){
+            int rgb[3];bool valid=true;
+            for(int c=0;c<3;c++){
+                int hi=fromhex(color[1+c*2]),lo=fromhex(color[2+c*2]);
+                if(hi<0 || lo<0){valid=false;break;}rgb[c]=hi*16+lo;
+            }
+            if(valid){ok=lotus_manager_rgb(&manager,slot,(uint8_t)rgb[0],(uint8_t)rgb[1],(uint8_t)rgb[2]);
+                if(!manager.light[slot].power)lotus_manager_power(&manager,slot,true);
+            }
+        }
+    }
+    give();
+    if(!ok){httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Unsupported command or empty slot");return ESP_FAIL;}
+    lotus_diag_event("WEB light command",slot+1,0);
+    httpd_resp_set_status(req,"303 See Other");
+    httpd_resp_set_hdr(req,"Location","/lotus");
+    return httpd_resp_send(req,NULL,0);
 }
 bool lotus_restart_due(void){
     /* Failed networks cannot leave test mode stuck ON forever. */

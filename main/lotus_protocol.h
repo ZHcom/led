@@ -31,6 +31,7 @@ typedef struct {
     uint8_t g;
     uint8_t b;
     uint8_t brightness; /* 0..100 */
+    char name[32]; /* user label, UTF-8, null-terminated */
     bool pending_power;
     bool pending_rgb;
     bool pending_brightness;

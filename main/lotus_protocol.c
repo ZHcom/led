@@ -90,6 +90,12 @@ bool lotus_manager_power(lotus_manager_t *manager, size_t index, bool on)
     lotus_light_t *device = &manager->light[index];
     device->power = on;
     device->pending_power = true;
+    /* OFF is the last command: old queued color/brightness must not
+       immediately undo it on some ELK controllers. */
+    if(!on) {
+        device->pending_rgb=false;
+        device->pending_brightness=false;
+    }
     return true;
 }
 

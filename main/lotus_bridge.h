@@ -18,6 +18,8 @@ bool lotus_enabled(void);
 /* Route profile-E GATT events exclusively to Lotus when TEST/ON. */
 bool lotus_owns_gattc_if(esp_gatt_if_t gattc_if);
 void lotus_scan_seen(const uint8_t mac[6], esp_ble_addr_type_t type, int rssi);
+/* Observe named ELK controllers even while Lotus control is OFF. */
+void lotus_scan_candidate(const uint8_t mac[6], const char *adv_name, int rssi);
 bool lotus_busy(void);
 /* Called from the existing main loop, not an additional BLE scanner. */
 void lotus_tick(bool scanning, bool *scan_stop_req, bool setting_scan,
@@ -34,6 +36,8 @@ bool lotus_mqtt_message(const char *topic, int topic_len,
                         const char *prefix);
 esp_err_t lotus_http_get(httpd_req_t *request);
 esp_err_t lotus_http_post(httpd_req_t *request);
+/* Authenticated HTTP command; does not modify persistent configuration. */
+esp_err_t lotus_http_command(httpd_req_t *request);
 bool lotus_restart_due(void);
 
 #endif
