@@ -14387,6 +14387,9 @@ static void esp_gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp
 	if (lotus_enabled()) {
 		if (event == ESP_GATTC_REG_EVT && param &&
 		    param->reg.app_id == LOTUS_GATTC_APP_ID) {
+			/* Keep legacy profile-table state consistent for unrelated code. */
+			if (param->reg.status == ESP_GATT_OK)
+				gl_profile_tab[PROFILE_E_APP_ID].gattc_if = gattc_if;
 			lotus_gattc_event(event, gattc_if, param);
 			return;
 		}
@@ -35459,17 +35462,28 @@ void app_main(void)
 
 if (lotus_enabled()) lotus_diag_event("Before main loop",0,0);
 //r4s state nonitoring and command execution loop
+	uint32_t lotus_boot_loops=0;
 	while (floop) {
+	/* Record only the first two iterations. Continuous logging would erase
+	 * the evidence from RTC's 32-entry ring before the next panic. */
+	bool lotus_trace=lotus_enabled() && lotus_boot_loops < 2;
+	if (lotus_trace) lotus_diag_event("Main: before lotus_tick",(int)lotus_boot_loops,0);
 	lotus_tick(Isscanning, &StartStopScanReq, SetScanReq, f_update,
 	          BleDevStA.btopenreq || BleDevStB.btopenreq || BleDevStC.btopenreq ||
 	          BleDevStD.btopenreq || BleDevStE.btopenreq);
+	if (lotus_trace) lotus_diag_event("Main: after lotus_tick",(int)lotus_boot_loops,0);
 	if (lotus_restart_due()) esp_restart();
+	if (lotus_trace) lotus_diag_event("Main: before start_scan",(int)lotus_boot_loops,0);
 	if (!lotus_busy() && !Isscanning && !StartStopScanReq && !SetScanReq) start_scan();
+	if (lotus_trace) lotus_diag_event("Main: after start_scan",(int)lotus_boot_loops,0);
+	if (lotus_trace) lotus_diag_event("Main: before Redmond loop",(int)lotus_boot_loops,0);
 	lpcomstat(0);
 	lpcomstat(1);
 	lpcomstat(2);
 	lpcomstat(3);
 	lpcomstat(4);
+	if (lotus_trace) lotus_diag_event("Main: after Redmond loop",(int)lotus_boot_loops,0);
+	if (lotus_boot_loops < 2) ++lotus_boot_loops;
 	if (t_ppcons == 25) {
 	MqtDevInit(mqttConnected);
 	HDiscBlemon(mqttConnected);

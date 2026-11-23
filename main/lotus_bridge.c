@@ -18,6 +18,7 @@
 #include "esp_timer.h"
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 #include "esp_system.h"
@@ -151,6 +152,13 @@ static int64_t last_diagnostics_ms;
 static esp_gatt_if_t client_if=ESP_GATT_IF_NONE;
 static esp_mqtt_client_handle_t mqtt;
 static char base_topic[32];
+/* Publish MQTT Discovery from the r4sGate main loop, NOT the MQTT callback.
+ * Static scratch buffers protect the 4.4 kB ESP32 main-task stack. */
+static unsigned discovery_cursor;
+static int64_t next_discovery_ms;
+static char discovery_topic[160];
+static char discovery_json[1000];
+static char discovery_cmd[100];
 static uint8_t bt_type[LOTUS_MAX_LIGHTS];
 static bool seen[LOTUS_MAX_LIGHTS];
 static int rssi_values[LOTUS_MAX_LIGHTS];
@@ -222,6 +230,8 @@ void lotus_init(void) {
     trial_ends_ms=0;
     event_queue_overflow=false;
     scan_stop_received=false;
+    discovery_cursor=LOTUS_MAX_LIGHTS;
+    next_discovery_ms=0;
     memset(&manager,0,sizeof(manager));
     manager.count=LOTUS_MAX_LIGHTS;
     for(int i=0;i<(int)LOTUS_MAX_LIGHTS;i++){
@@ -331,8 +341,10 @@ void lotus_tick(bool scanning,bool *scan_stop_req,bool setting_scan,
         scan_stop_received=false;
         if(link_state==L_WAIT_SCAN_STOP) begin_open();
     }
-    if(now_ms()-last_diagnostics_ms>=30000){
+    if(now_ms()-last_diagnostics_ms>=10000){
         last_diagnostics_ms=now_ms();
+        lotus_diag_event("Lotus heap / stack bytes",(int)esp_get_free_heap_size(),
+                         (int)uxTaskGetStackHighWaterMark(NULL));
         ESP_LOGI(TAG,"status state=%d heap=%"PRIu32" trial=%d remaining=%lld s",(int)link_state,
                  (uint32_t)esp_get_free_heap_size(),trial_mode,
                  (long long)(trial_mode?(trial_ends_ms-now_ms())/1000:0));
@@ -388,6 +400,27 @@ void lotus_tick(bool scanning,bool *scan_stop_req,bool setting_scan,
     }
     /* Stage ONE MQTT publish under lock, then publish after releasing it.
      * Never block the main loop or MQTT worker while holding the BLE mutex. */
+    /* Stage one discovery for publication after the BLE mutex is released.
+     * This avoids synchronous cJSON + MQTT work in MQTT_EVENT_CONNECTED. */
+    esp_mqtt_client_handle_t discovery_client=NULL;
+    int discovery_slot=-1;
+    if (mqtt && discovery_cursor < LOTUS_MAX_LIGHTS && now >= next_discovery_ms) {
+        unsigned i=discovery_cursor++;
+        if (manager.light[i].enabled) {
+            char mac[13];
+            if (lotus_ha_discovery(&manager,i,base_topic,
+                                   discovery_topic,sizeof(discovery_topic),
+                                   discovery_json,sizeof(discovery_json))) {
+                lotus_mac_compact(manager.light[i].mac,mac);
+                snprintf(discovery_cmd,sizeof(discovery_cmd),"%s/lotus/%s/set",base_topic,mac);
+                discovery_client=mqtt;
+                discovery_slot=(int)i;
+                if (have_state[i]) publish_pending[i]=true;
+            } else {
+                lotus_diag_event("MQTT discovery encoding fail",i+1,0);
+            }
+        }
+    }
     char topic[96]={0},value[220]={0};
     esp_mqtt_client_handle_t client=mqtt;
     int publish_slot=-1;
@@ -406,6 +439,20 @@ void lotus_tick(bool scanning,bool *scan_stop_req,bool setting_scan,
         }
     }
     give();
+    if (discovery_slot>=0 && discovery_client) {
+        lotus_diag_event("MQTT discovery begin",discovery_slot+1,0);
+        int result=esp_mqtt_client_publish(discovery_client,discovery_topic,discovery_json,0,1,1);
+        int sub=result>=0?esp_mqtt_client_subscribe(discovery_client,discovery_cmd,0):-1;
+        lotus_diag_event("MQTT discovery result",result>=0,sub>=0);
+        if (result<0 || sub<0) {
+            take();
+            if (mqtt==discovery_client) {
+                discovery_cursor=(unsigned)discovery_slot;
+                next_discovery_ms=now_ms()+3000;
+            }
+            give();
+        }
+    }
     if(publish_slot>=0 && esp_mqtt_client_publish(client,topic,value,0,1,1)<0) {
         take();
         if(enabled && mqtt==client)publish_pending[publish_slot]=true;
@@ -512,27 +559,15 @@ static void lotus_process_gatt_event(esp_gattc_cb_event_t event,esp_gatt_if_t in
 
 void lotus_mqtt_connected(esp_mqtt_client_handle_t client,const char *prefix){
     if(!enabled || !client || !prefix)return;
+    /* Publish/subscribe belongs in lotus_tick(), never the MQTT callback.
+     * This also leaves clear RTC breadcrumbs at the next main-loop tick. */
     take();
     mqtt=client;
     snprintf(base_topic,sizeof(base_topic),"%s",prefix);
+    discovery_cursor=0;
+    next_discovery_ms=0;
     give();
-    /* MQTT publish / subscribe may wait for network: never hold mutex. */
-    for(int i=0;i<(int)LOTUS_MAX_LIGHTS;i++){
-        char topic[160]={0},json[1000]={0},mac[13],cmd[100];
-        bool configured;
-        take();
-        configured=enabled && manager.light[i].enabled;
-        if(configured){
-            configured=lotus_ha_discovery(&manager,i,base_topic,topic,sizeof(topic),json,sizeof(json));
-            lotus_mac_compact(manager.light[i].mac,mac);
-            if(have_state[i])publish_pending[i]=true;
-        }
-        give();
-        if(!configured)continue;
-        esp_mqtt_client_publish(client,topic,json,0,1,1);
-        snprintf(cmd,sizeof(cmd),"%s/lotus/%s/set",base_topic,mac);
-        esp_mqtt_client_subscribe(client,cmd,0);
-    }
+    lotus_diag_event("MQTT session queued",0,0);
 }
 void lotus_mqtt_disconnected(void){
     take();mqtt=NULL;give();
@@ -577,7 +612,7 @@ esp_err_t lotus_http_get(httpd_req_t *req){
     give();
     httpd_resp_set_type(req,"text/html; charset=utf-8");
     httpd_resp_set_hdr(req,"Cache-Control","no-store, no-cache, must-revalidate");
-    httpd_resp_sendstr_chunk(req,"<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Lotus Lantern v3</title><style>body{font:16px system-ui;background:#161b22;color:#e6edf3;max-width:760px;margin:25px auto;padding:12px}input,select{font-size:1rem;padding:12px;background:#fff;border:0;border-radius:7px;max-width:230px}label{display:block;margin:18px 0}button{background:#238636;color:#fff;border:0;border-radius:7px;padding:12px 20px}a{color:#58a6ff}.warn{color:#ffb86c}</style></head><body><h1>Lotus Lantern v3</h1><p>Five BLE strip slots. Thermometers use the original scanner. BLE control is <b>OFF by default</b>.</p>");
+    httpd_resp_sendstr_chunk(req,"<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Lotus Lantern v5</title><style>body{font:16px system-ui;background:#161b22;color:#e6edf3;max-width:760px;margin:25px auto;padding:12px}input,select{font-size:1rem;padding:12px;background:#fff;border:0;border-radius:7px;max-width:230px}label{display:block;margin:18px 0}button{background:#238636;color:#fff;border:0;border-radius:7px;padding:12px 20px}a{color:#58a6ff}.warn{color:#ffb86c}</style></head><body><h1>Lotus Lantern v5</h1><p>Five BLE strip slots. Thermometers use the original scanner. BLE control is <b>OFF by default</b>.</p>");
     char status[240];
     snprintf(status,sizeof(status),"<p><b>Status: %s</b>%s%lld%s. Free heap: %"PRIu32" bytes.</p>",
              active?(is_trial?"TRIAL":"ENABLED"):"DISABLED",
