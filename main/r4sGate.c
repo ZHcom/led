@@ -14375,13 +14375,26 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
 }
 //*** Gap event handler end **********************
 
+/* Compile-time guard: Lotus must share the existing fifth client. */
+#if LOTUS_GATTC_APP_ID != PROFILE_E_APP_ID
+#error "Lotus GATTC must share r4sGate profile E (app_id 4)"
+#endif
 static void esp_gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param)
 {
-	if (event == ESP_GATTC_REG_EVT && param->reg.app_id == LOTUS_GATTC_APP_ID) {
-		lotus_gattc_event(event, gattc_if, param);
-		return;
+	/* Lotus v4: reuse profile E (app 4) rather than registering a 6th
+	 * Bluedroid client. Thermometers use GAP scanning, not profile E.
+	 * Do not send Lotus events to the legacy Redmond profile E handler. */
+	if (lotus_enabled()) {
+		if (event == ESP_GATTC_REG_EVT && param &&
+		    param->reg.app_id == LOTUS_GATTC_APP_ID) {
+			lotus_gattc_event(event, gattc_if, param);
+			return;
+		}
+		if (lotus_owns_gattc_if(gattc_if)) {
+			lotus_gattc_event(event, gattc_if, param);
+			return;
+		}
 	}
-	lotus_gattc_event(event, gattc_if, param);
 //	if (fdebug) ESP_LOGI(AP_TAG, "EVT %d, gattc if %d, app_id %d", event, gattc_if, param->reg.app_id);
 
     /* If event is register event, store the gattc_if for each profile */
@@ -35358,18 +35371,15 @@ void app_main(void)
 	fflush(stdout);
 	esp_restart();
 	}
+	/* Only five app registrations in total (A..E): profile E is
+	 * owned by Lotus during TEST/ON, and by original r4sGate in OFF. */
+	if (lotus_enabled()) lotus_diag_event("Before shared E registration",PROFILE_E_APP_ID,0);
 	ret = esp_ble_gattc_app_register(PROFILE_E_APP_ID);
+	if (lotus_enabled()) lotus_diag_event("After shared E registration",(int)ret,0);
 	if (ret){
 	if (fdebug) ESP_LOGI(AP_TAG,"%s gattc app register failed, error code = 0x%X\n", __func__, ret);
 	fflush(stdout);
 	esp_restart();
-	}
-	/* Fail-safe: v2 stays passive until enabled via /lotus. */
-	if (lotus_enabled()) {
-		lotus_diag_event("Before GATTC registration",LOTUS_GATTC_APP_ID,0);
-		ret = esp_ble_gattc_app_register(LOTUS_GATTC_APP_ID);
-		lotus_diag_event("After GATTC registration",(int)ret,0);
-		if (ret != ESP_OK) ESP_LOGE(AP_TAG,"Lotus GATTC register: %s",esp_err_to_name(ret));
 	}
 //	ret = esp_ble_gatt_set_local_mtu(BLE_INPUT_BUFFSIZE);
 	ret = esp_ble_gatt_set_local_mtu(128);
@@ -35433,6 +35443,7 @@ void app_main(void)
 /* Start the server for the first time */
 //	server = start_webserver();
 	start_webserver();
+	if (lotus_enabled()) lotus_diag_event("After HTTP server start",0,0);
 
 
 // mark as valid boot for prevent rollback after ota
@@ -35446,6 +35457,7 @@ void app_main(void)
 	MyHttpMqtt |= 0x40;
 #endif
 
+if (lotus_enabled()) lotus_diag_event("Before main loop",0,0);
 //r4s state nonitoring and command execution loop
 	while (floop) {
 	lotus_tick(Isscanning, &StartStopScanReq, SetScanReq, f_update,

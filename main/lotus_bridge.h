@@ -8,13 +8,15 @@
 #include "esp_http_server.h"
 #include "mqtt_client.h"
 
-/* One extra GATTC profile, reusing r4sGate's existing Bluedroid stack. */
-#define LOTUS_GATTC_APP_ID 5
+/* Shared with r4sGate profile E (app 4). No extra GATT registration. */
+#define LOTUS_GATTC_APP_ID 4
 
 void lotus_init(void);
 /* RTC-retained crash breadcrumbs, visible on /lotus, no credentials stored. */
 void lotus_diag_event(const char *stage, int a, int b);
 bool lotus_enabled(void);
+/* Route profile-E GATT events exclusively to Lotus when TEST/ON. */
+bool lotus_owns_gattc_if(esp_gatt_if_t gattc_if);
 void lotus_scan_seen(const uint8_t mac[6], esp_ble_addr_type_t type, int rssi);
 bool lotus_busy(void);
 /* Called from the existing main loop, not an additional BLE scanner. */

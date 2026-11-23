@@ -209,6 +209,10 @@ static void close_connection(void) {
 }
 
 bool lotus_enabled(void) { return enabled; }
+bool lotus_owns_gattc_if(esp_gatt_if_t gattc_if) {
+    return enabled && client_if != ESP_GATT_IF_NONE &&
+           gattc_if != ESP_GATT_IF_NONE && gattc_if == client_if;
+}
 
 void lotus_init(void) {
     lotus_diag_boot();
