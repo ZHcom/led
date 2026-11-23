@@ -9,6 +9,7 @@
 #include "lotus_ha.h"
 
 #include <stdio.h>
+#include <inttypes.h>
 #include <string.h>
 #include <strings.h>
 #include <ctype.h>
@@ -18,6 +19,8 @@
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
+#include "esp_system.h"
 
 #define LOTUS_OPEN_TIMEOUT_MS 10000
 #define LOTUS_SCAN_TIMEOUT_MS 4000
@@ -25,10 +28,25 @@
 #define LOTUS_IDLE_DISCONNECT_MS 900
 #define LOTUS_COMMAND_SPACING_MS 220
 #define LOTUS_ADV_MAX_AGE_MS 30000
+#define LOTUS_TRIAL_MS 120000
+#define LOTUS_EVENT_QUEUE_LEN 16
 
 static const char *TAG="lotus";
 static lotus_manager_t manager;
 static SemaphoreHandle_t mutex;
+/* Callback -> main loop: no mutex waits, BLE API calls, or MQTT from Bluedroid. */
+typedef struct {
+    esp_gattc_cb_event_t event;
+    esp_gatt_if_t interface;
+    esp_ble_gattc_cb_param_t param;
+} lotus_gatt_event_t;
+static QueueHandle_t gatt_events;
+static volatile bool event_queue_overflow;
+static volatile bool scan_stop_received;
+static bool enabled;
+static bool trial_mode;
+static int64_t trial_ends_ms;
+static int64_t last_diagnostics_ms;
 static esp_gatt_if_t client_if=ESP_GATT_IF_NONE;
 static esp_mqtt_client_handle_t mqtt;
 static char base_topic[32];
@@ -85,17 +103,37 @@ static void close_connection(void) {
     if(link_state!=L_OPENING)reset_connection();
 }
 
+bool lotus_enabled(void) { return enabled; }
+
 void lotus_init(void) {
+    enabled=false;
+    trial_mode=false;
+    trial_ends_ms=0;
+    event_queue_overflow=false;
+    scan_stop_received=false;
     memset(&manager,0,sizeof(manager));
     manager.count=LOTUS_MAX_LIGHTS;
     for(int i=0;i<(int)LOTUS_MAX_LIGHTS;i++){
         manager.light[i].r=manager.light[i].g=manager.light[i].b=255;
         manager.light[i].brightness=100;
     }
-    if(!mutex)mutex=xSemaphoreCreateMutex();
     nvs_handle_t h;
     if(nvs_open("lotus",NVS_READWRITE,&h)==ESP_OK){
-        uint8_t initialized=0;
+        /* Version 2 fail-safe: an existing v1 MAC does NOT enable BLE traffic.
+         * A one-time trial flag is consumed before any BLE connection can open,
+         * so a crash/reboot during the trial always comes back disabled. */
+        uint8_t always=0, trial=0, initialized=0;
+        nvs_get_u8(h,"mode",&always);
+        nvs_get_u8(h,"trial",&trial);
+        if(trial){
+            nvs_set_u8(h,"trial",0);
+            nvs_commit(h);
+            enabled=true;
+            trial_mode=true;
+            trial_ends_ms=now_ms()+LOTUS_TRIAL_MS;
+        }else if(always==1){
+            enabled=true;
+        }
         nvs_get_u8(h,"init",&initialized);
         if(!initialized){
             /* First strip was verified in nRF Connect by the owner. */
@@ -113,11 +151,21 @@ void lotus_init(void) {
         }
         nvs_close(h);
     }
-    ESP_LOGI(TAG,"Lotus manager ready (5 slots; no extra BLE scanner)");
+    /* No extra FreeRTOS allocations at all while Lotus is disabled. */
+    if(enabled){
+        if(!mutex)mutex=xSemaphoreCreateMutex();
+        if(!gatt_events)gatt_events=xQueueCreate(LOTUS_EVENT_QUEUE_LEN,sizeof(lotus_gatt_event_t));
+        if(!mutex || !gatt_events){
+            ESP_LOGE(TAG,"Lotus allocation failed; BLE control disabled");
+            enabled=false;
+        }
+    }
+    ESP_LOGI(TAG,"Lotus manager ready; enabled=%d trial=%d; 5 slots; shared passive scan",enabled,trial_mode);
 }
 void lotus_scan_seen(const uint8_t mac[6], esp_ble_addr_type_t type, int rssi){
-    if(!mac)return;
-    take();
+    if(!enabled || !mac || !mutex)return;
+    /* Called for every BLE advertisement on the Bluedroid task: NEVER wait. */
+    if(xSemaphoreTake(mutex,0)!=pdTRUE)return;
     for(int i=0;i<(int)LOTUS_MAX_LIGHTS;i++){
         if(manager.light[i].enabled && !memcmp(mac,manager.light[i].mac,6)){
             bt_type[i]=(uint8_t)type;seen[i]=true;
@@ -127,12 +175,47 @@ void lotus_scan_seen(const uint8_t mac[6], esp_ble_addr_type_t type, int rssi){
     }
     give();
 }
-bool lotus_busy(void) {return link_state!=L_IDLE;}
+bool lotus_busy(void) {return enabled && link_state!=L_IDLE;}
+
+static void lotus_process_gatt_event(esp_gattc_cb_event_t event,esp_gatt_if_t interface,
+                                     esp_ble_gattc_cb_param_t *p);
 
 void lotus_tick(bool scanning,bool *scan_stop_req,bool setting_scan,
                 bool ota_active,bool other_ble_busy) {
-    if(!mutex||ota_active)return;
+    if(!enabled || !mutex || !gatt_events || ota_active)return;
     take();
+    /* BLE events are applied only here, outside Bluedroid callback context. */
+    if(event_queue_overflow){
+        ESP_LOGE(TAG,"GATT event queue overflow: stopping Lotus until reboot");
+        enabled=false;
+        restart_at=now_ms()+1500;
+        restart_requested=true;
+        give();
+        /* Persistent mode must not create a crash loop. */
+        nvs_handle_t h;
+        if(nvs_open("lotus",NVS_READWRITE,&h)==ESP_OK){
+            nvs_set_u8(h,"mode",0);
+            nvs_set_u8(h,"trial",0);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+        return;
+    }
+    lotus_gatt_event_t ev;
+    int budget=LOTUS_EVENT_QUEUE_LEN;
+    while(budget-- > 0 && xQueueReceive(gatt_events,&ev,0)==pdTRUE){
+        lotus_process_gatt_event(ev.event,ev.interface,&ev.param);
+    }
+    if(scan_stop_received){
+        scan_stop_received=false;
+        if(link_state==L_WAIT_SCAN_STOP) begin_open();
+    }
+    if(now_ms()-last_diagnostics_ms>=30000){
+        last_diagnostics_ms=now_ms();
+        ESP_LOGI(TAG,"status state=%d heap=%"PRIu32" trial=%d remaining=%lld s",(int)link_state,
+                 (uint32_t)esp_get_free_heap_size(),trial_mode,
+                 (long long)(trial_mode?(trial_ends_ms-now_ms())/1000:0));
+    }
     int64_t now=now_ms();
     if(link_state==L_IDLE && !other_ble_busy && client_if!=ESP_GATT_IF_NONE) {
         int candidate=next_pending();
@@ -179,39 +262,55 @@ void lotus_tick(bool scanning,bool *scan_stop_req,bool setting_scan,
             fail_connection();
         } else fail_connection();
     }
-    /* Publish only when requested values were accepted by Bluedroid (assumed state).
-       These controllers do not reliably report back their physical state. */
-    if(mqtt && base_topic[0]) {
+    /* Stage ONE MQTT publish under lock, then publish after releasing it.
+     * Never block the main loop or MQTT worker while holding the BLE mutex. */
+    char topic[96]={0},value[220]={0};
+    esp_mqtt_client_handle_t client=mqtt;
+    int publish_slot=-1;
+    if(client && base_topic[0]) {
         for(int i=0;i<(int)LOTUS_MAX_LIGHTS;i++) {
             if(publish_pending[i] && !any_pending(i)){
-                char mac[13],topic[96],value[220];
+                char mac[13];
                 lotus_mac_compact(manager.light[i].mac,mac);
                 snprintf(topic,sizeof(topic),"%s/lotus/%s/state",base_topic,mac);
                 if(lotus_ha_state(&manager,i,value,sizeof(value))) {
-                    esp_mqtt_client_publish(mqtt,topic,value,0,1,1);
                     publish_pending[i]=false;
+                    publish_slot=i;
                 }
+                break;
             }
         }
     }
     give();
+    if(publish_slot>=0 && esp_mqtt_client_publish(client,topic,value,0,1,1)<0) {
+        take();
+        if(enabled && mqtt==client)publish_pending[publish_slot]=true;
+        give();
+    }
 }
 bool lotus_scan_stopped(void) {
-    if(link_state!=L_WAIT_SCAN_STOP)return false;
-    take();begin_open();give();return true;
+    if(!enabled || link_state!=L_WAIT_SCAN_STOP)return false;
+    /* Bluedroid callback: signal the main loop, do not wait or open here. */
+    scan_stop_received=true;
+    return true;
 }
 
 void lotus_gattc_event(esp_gattc_cb_event_t event,esp_gatt_if_t interface,
                        esp_ble_gattc_cb_param_t *p){
-    if(!p)return;
+    if(!enabled || !p) return;
     if(event==ESP_GATTC_REG_EVT){
         if(p->reg.app_id==LOTUS_GATTC_APP_ID && p->reg.status==ESP_GATT_OK){
             client_if=interface;ESP_LOGI(TAG,"GATTC registered: %u",(unsigned)interface);
         }
         return;
     }
-    if(client_if==ESP_GATT_IF_NONE || interface!=client_if)return;
-    take();
+    if(client_if==ESP_GATT_IF_NONE || interface!=client_if || !gatt_events)return;
+    lotus_gatt_event_t ev={.event=event,.interface=interface,.param=*p};
+    if(xQueueSend(gatt_events,&ev,0)!=pdTRUE)event_queue_overflow=true;
+}
+
+static void lotus_process_gatt_event(esp_gattc_cb_event_t event,esp_gatt_if_t interface,
+                                     esp_ble_gattc_cb_param_t *p){
     switch(event){
     case ESP_GATTC_OPEN_EVT:
         if(link_state!=L_OPENING || active<0 || memcmp(p->open.remote_bda,manager.light[active].mac,6)){
@@ -270,31 +369,37 @@ void lotus_gattc_event(esp_gattc_cb_event_t event,esp_gatt_if_t interface,
         break;
     default:break;
     }
-    give();
 }
 
 void lotus_mqtt_connected(esp_mqtt_client_handle_t client,const char *prefix){
-    if(!client||!prefix)return;
-    take();mqtt=client;
+    if(!enabled || !client || !prefix)return;
+    take();
+    mqtt=client;
     snprintf(base_topic,sizeof(base_topic),"%s",prefix);
+    give();
+    /* MQTT publish / subscribe may wait for network: never hold mutex. */
     for(int i=0;i<(int)LOTUS_MAX_LIGHTS;i++){
-        if(!manager.light[i].enabled)continue;
-        char topic[160],json[1000],mac[13],cmd[100];
-        if(lotus_ha_discovery(&manager,i,base_topic,topic,sizeof(topic),json,sizeof(json)))
-            esp_mqtt_client_publish(client,topic,json,0,1,1);
-        lotus_mac_compact(manager.light[i].mac,mac);
+        char topic[160]={0},json[1000]={0},mac[13],cmd[100];
+        bool configured;
+        take();
+        configured=enabled && manager.light[i].enabled;
+        if(configured){
+            configured=lotus_ha_discovery(&manager,i,base_topic,topic,sizeof(topic),json,sizeof(json));
+            lotus_mac_compact(manager.light[i].mac,mac);
+            if(have_state[i])publish_pending[i]=true;
+        }
+        give();
+        if(!configured)continue;
+        esp_mqtt_client_publish(client,topic,json,0,1,1);
         snprintf(cmd,sizeof(cmd),"%s/lotus/%s/set",base_topic,mac);
         esp_mqtt_client_subscribe(client,cmd,0);
-        /* Re-send last assumed state ONLY if it was set in this boot. */
-        if(have_state[i])publish_pending[i]=true;
     }
-    give();
 }
 void lotus_mqtt_disconnected(void){
     take();mqtt=NULL;give();
 }
 bool lotus_mqtt_message(const char *topic,int topic_len,const char *payload,int payload_len,const char *prefix){
-    if(!topic||!payload||topic_len<=0||payload_len<=0||payload_len>1024||!prefix)return false;
+    if(!enabled || !topic||!payload||topic_len<=0||payload_len<=0||payload_len>1024||!prefix)return false;
     take();
     bool handled=lotus_ha_parse_command(&manager,prefix,topic,(size_t)topic_len,
                                          payload,(size_t)payload_len);
@@ -311,16 +416,35 @@ static void mac_text(int slot,char out[18]){
     snprintf(out,18,"%02X:%02X:%02X:%02X:%02X:%02X",m[0],m[1],m[2],m[3],m[4],m[5]);
 }
 esp_err_t lotus_http_get(httpd_req_t *req){
-    httpd_resp_set_type(req,"text/html; charset=utf-8");
-    httpd_resp_sendstr_chunk(req,"<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Lotus Lantern</title><style>body{font:16px system-ui;background:#161b22;color:#e6edf3;max-width:760px;margin:25px auto;padding:12px}input{font-size:1rem;padding:12px;background:#fff;border:0;border-radius:7px;max-width:220px}label{display:block;margin:18px 0}button{background:#238636;color:#fff;border:0;border-radius:7px;padding:12px 20px}a{color:#58a6ff}</style></head><body><h1>Lotus Lantern</h1><p>Five ELK-BLEDOM BLE light slots. Keep BLE monitor enabled for PVVX thermometers.</p><form action='/lotus/save' method='POST'>");
+    char macs[LOTUS_MAX_LIGHTS][18];
+    int rssis[LOTUS_MAX_LIGHTS];
+    int64_t ages[LOTUS_MAX_LIGHTS];
+    int64_t tm=now_ms();
     take();
     for(int i=0;i<(int)LOTUS_MAX_LIGHTS;i++){
-        char b[240],mac[18];mac_text(i,mac);
-        snprintf(b,sizeof(b),"<label>LED strip %d (MAC): <input name='mac%d' maxlength='17' placeholder='BE:37:FA:00:7F:F2' value='%s'></label>",i+1,i,mac);
+        mac_text(i,macs[i]);
+        rssis[i]=rssi_values[i];
+        ages[i]=seen[i]?((tm-last_seen[i])/1000):-1;
+    }
+    bool active=enabled,is_trial=trial_mode;
+    int64_t remaining=trial_mode?(trial_ends_ms-tm)/1000:0;
+    give();
+    httpd_resp_set_type(req,"text/html; charset=utf-8");
+    httpd_resp_sendstr_chunk(req,"<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Lotus Lantern v2</title><style>body{font:16px system-ui;background:#161b22;color:#e6edf3;max-width:760px;margin:25px auto;padding:12px}input,select{font-size:1rem;padding:12px;background:#fff;border:0;border-radius:7px;max-width:230px}label{display:block;margin:18px 0}button{background:#238636;color:#fff;border:0;border-radius:7px;padding:12px 20px}a{color:#58a6ff}.warn{color:#ffb86c}</style></head><body><h1>Lotus Lantern v2</h1><p>Five BLE strip slots. Thermometers use the original scanner. BLE control is <b>OFF by default</b>.</p>");
+    char status[240];
+    snprintf(status,sizeof(status),"<p><b>Status: %s</b>%s%lld%s. Free heap: %"PRIu32" bytes.</p>",
+             active?(is_trial?"TRIAL":"ENABLED"):"DISABLED",
+             is_trial?"; auto-restart in ":"", (long long)(is_trial?(remaining>0?remaining:0):0),
+             is_trial?" seconds":"",(uint32_t)esp_get_free_heap_size());
+    httpd_resp_sendstr_chunk(req,status);
+    httpd_resp_sendstr_chunk(req,"<form action='/lotus/save' method='POST'>");
+    for(int i=0;i<(int)LOTUS_MAX_LIGHTS;i++){
+        char b[256];
+        snprintf(b,sizeof(b),"<label>LED strip %d (MAC): <input name='mac%d' maxlength='17' placeholder='BE:37:FA:00:7F:F2' value='%s'></label><small>RSSI: %d dBm; seen %lld seconds ago</small>",
+                 i+1,i,macs[i],rssis[i],(long long)ages[i]);
         httpd_resp_sendstr_chunk(req,b);
     }
-    give();
-    httpd_resp_sendstr_chunk(req,"<p>Leave an empty MAC to disable a slot. The second ELK-BLEDDM may need a different protocol; test it before assigning. Save restarts the gateway.</p><button type='submit'>Save and reboot</button></form><p><a href='/'>Back to r4sGate</a></p></body></html>");
+    httpd_resp_sendstr_chunk(req,"<p>Unknown ELK-BLEDDM protocol has not been verified. Leave its MAC empty.</p><label>Mode: <select name='mode'><option value='off'>OFF (safest, default)</option><option value='trial'>TEST for 2 minutes, then auto-restart OFF</option><option value='on'>ALWAYS ON (only after successful test)</option></select></label><p class='warn'>Test mode is disarmed BEFORE BLE starts. A crash or reset will return to OFF. All save operations restart the ESP32.</p><button type='submit'>Save and reboot</button></form><p><a href='/'>Back to r4sGate</a></p></body></html>");
     return httpd_resp_sendstr_chunk(req,NULL);
 }
 static int fromhex(char c){if(c>='0'&&c<='9')return c-'0';if(c>='a'&&c<='f')return c-'a'+10;if(c>='A'&&c<='F')return c-'A'+10;return -1;}
@@ -341,13 +465,23 @@ esp_err_t lotus_http_post(httpd_req_t *req){
         pos+=n;
     }
     char macs[LOTUS_MAX_LIGHTS][18]={{0}};
+    char mode[8]={0};
+    bool mode_field=false;
     bool fields[LOTUS_MAX_LIGHTS]={0};
     char *save=NULL;
     for(char *part=strtok_r(form,"&",&save);part;part=strtok_r(NULL,"&",&save)){
+        if(!strncmp(part,"mode=",5)){
+            decode_form_value(part+5,strlen(part+5),mode,sizeof(mode));
+            mode_field=true;
+            continue;
+        }
         if(strncmp(part,"mac",3)||part[3]<'0'||part[3]>'4'||part[4]!='=')continue;
         int slot=part[3]-'0';
         decode_form_value(part+5,strlen(part+5),macs[slot],sizeof(macs[slot]));
         fields[slot]=true;
+    }
+    if(!mode_field || (strcmp(mode,"off") && strcmp(mode,"trial") && strcmp(mode,"on"))){
+        httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Invalid mode");return ESP_FAIL;
     }
     for(int i=0;i<(int)LOTUS_MAX_LIGHTS;i++){
         if(!fields[i] || (macs[i][0] && !lotus_parse_mac(macs[i],(uint8_t[6]){0}))){
@@ -364,6 +498,8 @@ esp_err_t lotus_http_post(httpd_req_t *req){
         char key[8];snprintf(key,sizeof(key),"mac%d",i);
         if(nvs_set_str(h,key,macs[i])!=ESP_OK)ret=ESP_FAIL;
     }
+    if(ret==ESP_OK && nvs_set_u8(h,"mode",!strcmp(mode,"on")?1:0)!=ESP_OK)ret=ESP_FAIL;
+    if(ret==ESP_OK && nvs_set_u8(h,"trial",!strcmp(mode,"trial")?1:0)!=ESP_OK)ret=ESP_FAIL;
     if(ret==ESP_OK)ret=nvs_commit(h);
     nvs_close(h);
     if(ret!=ESP_OK){httpd_resp_send_err(req,HTTPD_500_INTERNAL_SERVER_ERROR,"NVS write failed");return ESP_FAIL;}
@@ -373,4 +509,8 @@ esp_err_t lotus_http_post(httpd_req_t *req){
     restart_at=now_ms()+2000;restart_requested=true;
     return ESP_OK;
 }
-bool lotus_restart_due(void){return restart_requested && now_ms()>restart_at;}
+bool lotus_restart_due(void){
+    /* Failed networks cannot leave test mode stuck ON forever. */
+    return (restart_requested && now_ms()>restart_at) ||
+           (trial_mode && trial_ends_ms>0 && now_ms()>trial_ends_ms);
+}

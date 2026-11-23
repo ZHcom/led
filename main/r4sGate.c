@@ -35364,8 +35364,11 @@ void app_main(void)
 	fflush(stdout);
 	esp_restart();
 	}
-	ret = esp_ble_gattc_app_register(LOTUS_GATTC_APP_ID);
-	if (ret != ESP_OK) ESP_LOGE(AP_TAG,"Lotus GATTC register: %s",esp_err_to_name(ret));
+	/* Fail-safe: v2 stays passive until enabled via /lotus. */
+	if (lotus_enabled()) {
+		ret = esp_ble_gattc_app_register(LOTUS_GATTC_APP_ID);
+		if (ret != ESP_OK) ESP_LOGE(AP_TAG,"Lotus GATTC register: %s",esp_err_to_name(ret));
+	}
 //	ret = esp_ble_gatt_set_local_mtu(BLE_INPUT_BUFFSIZE);
 	ret = esp_ble_gatt_set_local_mtu(128);
 	if (ret){
