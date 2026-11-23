@@ -23,7 +23,7 @@ bool lotus_busy(void);
 void lotus_tick(bool scanning, bool *scan_stop_req, bool setting_scan,
                 bool ota_active, bool other_ble_busy);
 /* Return true if Lotus took ownership of the completed scan-stop event. */
-bool lotus_scan_stopped(void);
+bool lotus_scan_stopped(bool success);
 /* Called by r4sGate's existing GATTC dispatcher. */
 void lotus_gattc_event(esp_gattc_cb_event_t event, esp_gatt_if_t interface,
                        esp_ble_gattc_cb_param_t *param);

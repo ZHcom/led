@@ -145,6 +145,7 @@ typedef struct {
 static QueueHandle_t gatt_events;
 static volatile bool event_queue_overflow;
 static volatile bool scan_stop_received;
+static volatile bool scan_stop_failed;
 static bool enabled;
 static bool trial_mode;
 static int64_t trial_ends_ms;
@@ -230,6 +231,7 @@ void lotus_init(void) {
     trial_ends_ms=0;
     event_queue_overflow=false;
     scan_stop_received=false;
+    scan_stop_failed=false;
     discovery_cursor=LOTUS_MAX_LIGHTS;
     next_discovery_ms=0;
     memset(&manager,0,sizeof(manager));
@@ -337,6 +339,12 @@ void lotus_tick(bool scanning,bool *scan_stop_req,bool setting_scan,
     while(budget-- > 0 && xQueueReceive(gatt_events,&ev,0)==pdTRUE){
         lotus_process_gatt_event(ev.event,ev.interface,&ev.param);
     }
+    if(scan_stop_failed){
+        scan_stop_failed=false;
+        scan_stop_received=false;
+        lotus_diag_event("Scan stop failed - retry",active+1,0);
+        if(link_state==L_WAIT_SCAN_STOP) fail_connection();
+    }
     if(scan_stop_received){
         scan_stop_received=false;
         if(link_state==L_WAIT_SCAN_STOP) begin_open();
@@ -355,10 +363,30 @@ void lotus_tick(bool scanning,bool *scan_stop_req,bool setting_scan,
         if(candidate>=0 && !setting_scan && !*scan_stop_req){
             active=candidate;
             if(scanning) {
-                if(esp_ble_gap_stop_scanning()==ESP_OK){
-                    *scan_stop_req=true;link_state=L_WAIT_SCAN_STOP;link_since=now;
-                } else active=-1;
-            } else begin_open();
+                /* Set ownership BEFORE requesting stop.  The Bluedroid GAP
+                 * callback can arrive before esp_ble_gap_stop_scanning()
+                 * returns; the old order dropped this completion and left
+                 * Lotus stuck in L_WAIT_SCAN_STOP until BLE TIMEOUT. */
+                link_state=L_WAIT_SCAN_STOP;
+                link_since=now;
+                scan_stop_received=false;
+                scan_stop_failed=false;
+                *scan_stop_req=true;
+                lotus_diag_event("Scan stop requested",active+1,1);
+                esp_err_t stop_err=esp_ble_gap_stop_scanning();
+                lotus_diag_event("Scan stop API result",(int)stop_err,active+1);
+                if(stop_err!=ESP_OK){
+                    /* No completion is owed after an API-level rejection. */
+                    *scan_stop_req=false;
+                    scan_stop_received=false;
+                    scan_stop_failed=false;
+                    lotus_diag_event("Scan stop API rejected",(int)stop_err,active+1);
+                    fail_connection();
+                }
+            } else {
+                lotus_diag_event("No scan, opening GATT",active+1,0);
+                begin_open();
+            }
         }
     } else if(link_state==L_READY) {
         if(now-last_tx>=LOTUS_COMMAND_SPACING_MS && active>=0) {
@@ -389,6 +417,15 @@ void lotus_tick(bool scanning,bool *scan_stop_req,bool setting_scan,
                     (link_state==L_CLOSING?LOTUS_CLOSE_TIMEOUT_MS:LOTUS_OPEN_TIMEOUT_MS))){
         lotus_diag_event("BLE TIMEOUT",(int)link_state,active+1);
         ESP_LOGW(TAG,"BLE timeout state=%d",(int)link_state);
+        if(link_state==L_WAIT_SCAN_STOP){
+            /* Release only the Lotus-owned scan-stop request on timeout;
+             * preserve the existing scanner and never open GATT without
+             * an acknowledged successful GAP stop event. */
+            *scan_stop_req=false;
+            scan_stop_received=false;
+            scan_stop_failed=false;
+            lotus_diag_event("Stop event missing",(int)scanning,active+1);
+        }
         if(link_state==L_DISCOVERING||link_state==L_READY) {
             if(active>=0)retry_after[active]=now+5000;
             close_connection();
@@ -459,10 +496,14 @@ void lotus_tick(bool scanning,bool *scan_stop_req,bool setting_scan,
         give();
     }
 }
-bool lotus_scan_stopped(void) {
-    if(!enabled || link_state!=L_WAIT_SCAN_STOP)return false;
-    /* Bluedroid callback: signal the main loop, do not wait or open here. */
-    scan_stop_received=true;
+bool lotus_scan_stopped(bool success) {
+    if(!enabled)return false;
+    /* Record even a stray/early completion. a=success, b=link state. */
+    lotus_diag_event("GAP scan-stop callback",success?1:0,(int)link_state);
+    if(link_state!=L_WAIT_SCAN_STOP)return false;
+    /* Called from GAP callback: no blocking mutex or GATT calls here. */
+    if(success) scan_stop_received=true;
+    else scan_stop_failed=true;
     return true;
 }
 
@@ -577,7 +618,9 @@ bool lotus_mqtt_message(const char *topic,int topic_len,const char *payload,int 
     take();
     bool handled=lotus_ha_parse_command(&manager,prefix,topic,(size_t)topic_len,
                                          payload,(size_t)payload_len);
-    give();return handled;
+    give();
+    if(handled)lotus_diag_event("MQTT light command",1,payload_len);
+    return handled;
 }
 
 /* Keep configuration independent of original r4sGate NVS and protect these

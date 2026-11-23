@@ -14328,10 +14328,11 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
 	StartStopScanReq = false;
 	if (param->scan_stop_cmpl.status != ESP_BT_STATUS_SUCCESS){
 	if (fdebug) ESP_LOGE(AP_TAG, "Scan stop failed, error status = 0x%X", param->scan_stop_cmpl.status);
+	if (lotus_scan_stopped(false)) break;
 	} else {
 	Isscanning = false;
 	if (fdebug) ESP_LOGI(AP_TAG, "Scan stop successfully");
-	if (lotus_scan_stopped()) break;
+	if (lotus_scan_stopped(true)) break;
 	if (!BleDevStA.btopen && BleDevStA.btopenreq) {
 	if (fdebug) ESP_LOGI(AP_TAG, "Connect %d to the remote device", 1);
 	esp_ble_gattc_open(gl_profile_tab[PROFILE_A_APP_ID].gattc_if, scan_rst_bda, scan_rst_bda_type, true);
