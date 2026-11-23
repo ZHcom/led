@@ -12,6 +12,8 @@
 #define LOTUS_GATTC_APP_ID 5
 
 void lotus_init(void);
+/* RTC-retained crash breadcrumbs, visible on /lotus, no credentials stored. */
+void lotus_diag_event(const char *stage, int a, int b);
 bool lotus_enabled(void);
 void lotus_scan_seen(const uint8_t mac[6], esp_ble_addr_type_t type, int rssi);
 bool lotus_busy(void);

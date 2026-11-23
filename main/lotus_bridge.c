@@ -21,6 +21,7 @@
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 #include "esp_system.h"
+#include "esp_attr.h"
 
 #define LOTUS_OPEN_TIMEOUT_MS 10000
 #define LOTUS_SCAN_TIMEOUT_MS 4000
@@ -30,6 +31,106 @@
 #define LOTUS_ADV_MAX_AGE_MS 30000
 #define LOTUS_TRIAL_MS 120000
 #define LOTUS_EVENT_QUEUE_LEN 16
+
+/* v3: crash breadcrumbs in RTC no-init RAM. No flash write for each event.
+ * RTC memory is normally retained across SW/PANIC resets but not power loss.
+ * Only stage markers, BLE status/error codes are recorded (no secrets).
+ */
+#define LOTUS_DIAG_MAGIC 0x4c4f5433u
+#define LOTUS_DIAG_CAP 32u
+typedef struct {
+    uint32_t boot;
+    uint32_t at_ms;
+    int32_t a, b;
+    char stage[36];
+} lotus_diag_entry_t;
+typedef struct {
+    uint32_t magic, inverted_magic;
+    uint32_t boot, head;
+    uint32_t last_reset;
+    char previous_stage[36];
+    lotus_diag_entry_t entries[LOTUS_DIAG_CAP];
+} lotus_diag_store_t;
+RTC_NOINIT_ATTR static lotus_diag_store_t lotus_diag_rtc;
+static portMUX_TYPE lotus_diag_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool lotus_diag_ready;
+
+static const char *lotus_reset_name(esp_reset_reason_t r) {
+    switch (r) {
+    case ESP_RST_POWERON: return "POWER_ON";
+    case ESP_RST_SW: return "SOFTWARE";
+    case ESP_RST_PANIC: return "PANIC";
+    case ESP_RST_INT_WDT: return "INT_WDT";
+    case ESP_RST_TASK_WDT: return "TASK_WDT";
+    case ESP_RST_WDT: return "WDT";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";
+    default: return "OTHER";
+    }
+}
+
+void lotus_diag_event(const char *stage, int a, int b) {
+    if (!lotus_diag_ready || !stage) return;
+    /* Constant-time and non-allocating. Safe to call from Bluedroid task. */
+    uint32_t ms=(uint32_t)(esp_timer_get_time()/1000);
+    char safe_stage[36];
+    snprintf(safe_stage,sizeof(safe_stage),"%s",stage);
+    portENTER_CRITICAL(&lotus_diag_mux);
+    uint32_t ix=lotus_diag_rtc.head++ % LOTUS_DIAG_CAP;
+    lotus_diag_entry_t *e=&lotus_diag_rtc.entries[ix];
+    e->boot=lotus_diag_rtc.boot;
+    e->at_ms=ms; e->a=a; e->b=b;
+    memcpy(e->stage,safe_stage,sizeof(e->stage));
+    portEXIT_CRITICAL(&lotus_diag_mux);
+}
+
+static void lotus_diag_boot(void) {
+    const esp_reset_reason_t reason=esp_reset_reason();
+    /* No NVS writes here: previous entries survive a normal panic reset. */
+    if (lotus_diag_rtc.magic!=LOTUS_DIAG_MAGIC ||
+        lotus_diag_rtc.inverted_magic!=~LOTUS_DIAG_MAGIC ||
+        lotus_diag_rtc.head>1000000u) {
+        memset(&lotus_diag_rtc,0,sizeof(lotus_diag_rtc));
+        lotus_diag_rtc.magic=LOTUS_DIAG_MAGIC;
+        lotus_diag_rtc.inverted_magic=~LOTUS_DIAG_MAGIC;
+    }
+    if (lotus_diag_rtc.head>0) {
+        lotus_diag_entry_t *last=&lotus_diag_rtc.entries[(lotus_diag_rtc.head-1)%LOTUS_DIAG_CAP];
+        snprintf(lotus_diag_rtc.previous_stage,sizeof(lotus_diag_rtc.previous_stage),
+                 "%s",last->stage);
+    }
+    ++lotus_diag_rtc.boot;
+    lotus_diag_rtc.last_reset=(uint32_t)reason;
+    lotus_diag_ready=true;
+    lotus_diag_event("BOOT",(int)reason,0);
+}
+
+/* Build one plain text line at a time; no multi-KB copies on web task stack. */
+static void lotus_diag_render(httpd_req_t *req, bool html) {
+    uint32_t head, boot, reset;
+    char previous[36];
+    portENTER_CRITICAL(&lotus_diag_mux);
+    head=lotus_diag_rtc.head; boot=lotus_diag_rtc.boot; reset=lotus_diag_rtc.last_reset;
+    memcpy(previous,lotus_diag_rtc.previous_stage,sizeof(previous));
+    portEXIT_CRITICAL(&lotus_diag_mux);
+    char row[192];
+    if (html) {
+        httpd_resp_sendstr_chunk(req,"<h2>Crash / Bluetooth diagnostic log</h2><p>Saved in RTC memory across most software and panic resets; a power cut can clear it. Does not contain a full CPU backtrace.</p><pre id='lotus-log' style='white-space:pre-wrap;overflow-wrap:anywhere;background:#0d1117;padding:14px;border-radius:8px'>");
+    }
+    snprintf(row,sizeof(row),"Current boot: %"PRIu32" | Last reset: %s (%"PRIu32")\nPrevious boot last step: %s\n\n",
+             boot,lotus_reset_name((esp_reset_reason_t)reset),reset,previous[0]?previous:"not retained");
+    httpd_resp_sendstr_chunk(req,row);
+    uint32_t start=(head>LOTUS_DIAG_CAP)?head-LOTUS_DIAG_CAP:0;
+    for(uint32_t n=start;n<head;n++) {
+        lotus_diag_entry_t e;
+        portENTER_CRITICAL(&lotus_diag_mux);
+        e=lotus_diag_rtc.entries[n%LOTUS_DIAG_CAP];
+        portEXIT_CRITICAL(&lotus_diag_mux);
+        snprintf(row,sizeof(row),"boot %"PRIu32" +%"PRIu32" ms | %-32s | a=%"PRId32" b=%"PRId32"\n",
+                 e.boot,e.at_ms,e.stage,e.a,e.b);
+        httpd_resp_sendstr_chunk(req,row);
+    }
+    if (html) httpd_resp_sendstr_chunk(req,"</pre><p><a href='/lotus?log=1'>Open text log for copying</a> | <a href='/lotus'>Refresh page</a>. Log refreshes every 5 seconds while this page is open.</p><script>setInterval(function(){fetch('/lotus?log=1',{cache:'no-store'}).then(function(r){if(!r.ok)throw Error(r.status);return r.text()}).then(function(s){document.getElementById('lotus-log').textContent=s}).catch(function(){})},5000)</script>");
+}
 
 static const char *TAG="lotus";
 static lotus_manager_t manager;
@@ -89,9 +190,13 @@ static void fail_connection(void) {
 }
 static void begin_open(void) {
     if(active<0 || active>=(int)LOTUS_MAX_LIGHTS || client_if==ESP_GATT_IF_NONE) {reset_connection();return;}
+    lotus_diag_event("GATT open requested",active+1,(int)bt_type[active]);
     esp_err_t err=esp_ble_gattc_open(client_if,manager.light[active].mac,
                                       (esp_ble_addr_type_t)bt_type[active],true);
-    if(err!=ESP_OK) {ESP_LOGW(TAG,"BLE open refused: %s",esp_err_to_name(err));fail_connection();return;}
+    if(err!=ESP_OK) {
+        lotus_diag_event("GATT open refused",(int)err,0);
+        ESP_LOGW(TAG,"BLE open refused: %s",esp_err_to_name(err));fail_connection();return;
+    }
     link_state=L_OPENING; link_since=now_ms();
 }
 static void close_connection(void) {
@@ -106,6 +211,8 @@ static void close_connection(void) {
 bool lotus_enabled(void) { return enabled; }
 
 void lotus_init(void) {
+    lotus_diag_boot();
+    lotus_diag_event("Init begin",0,0);
     enabled=false;
     trial_mode=false;
     trial_ends_ms=0;
@@ -126,13 +233,18 @@ void lotus_init(void) {
         nvs_get_u8(h,"mode",&always);
         nvs_get_u8(h,"trial",&trial);
         if(trial){
+            lotus_diag_event("Trial flag found",1,0);
             nvs_set_u8(h,"trial",0);
-            nvs_commit(h);
-            enabled=true;
-            trial_mode=true;
+            esp_err_t disarm_result=nvs_commit(h);
+            lotus_diag_event("Trial disarm commit",(int)disarm_result,0);
+            if(disarm_result==ESP_OK) {
+                enabled=true;
+                trial_mode=true;
+            }
             trial_ends_ms=now_ms()+LOTUS_TRIAL_MS;
         }else if(always==1){
             enabled=true;
+            lotus_diag_event("Always-on selected",1,0);
         }
         nvs_get_u8(h,"init",&initialized);
         if(!initialized){
@@ -153,13 +265,17 @@ void lotus_init(void) {
     }
     /* No extra FreeRTOS allocations at all while Lotus is disabled. */
     if(enabled){
+        lotus_diag_event("BLE alloc begin",0,0);
         if(!mutex)mutex=xSemaphoreCreateMutex();
         if(!gatt_events)gatt_events=xQueueCreate(LOTUS_EVENT_QUEUE_LEN,sizeof(lotus_gatt_event_t));
+        lotus_diag_event("BLE alloc result",mutex!=NULL,gatt_events!=NULL);
         if(!mutex || !gatt_events){
             ESP_LOGE(TAG,"Lotus allocation failed; BLE control disabled");
+            lotus_diag_event("BLE alloc FAILED",0,0);
             enabled=false;
         }
     }
+    lotus_diag_event("Init complete",enabled,trial_mode);
     ESP_LOGI(TAG,"Lotus manager ready; enabled=%d trial=%d; 5 slots; shared passive scan",enabled,trial_mode);
 }
 void lotus_scan_seen(const uint8_t mac[6], esp_ble_addr_type_t type, int rssi){
@@ -187,6 +303,7 @@ void lotus_tick(bool scanning,bool *scan_stop_req,bool setting_scan,
     /* BLE events are applied only here, outside Bluedroid callback context. */
     if(event_queue_overflow){
         ESP_LOGE(TAG,"GATT event queue overflow: stopping Lotus until reboot");
+        lotus_diag_event("QUEUE OVERFLOW - OFF",0,0);
         enabled=false;
         restart_at=now_ms()+1500;
         restart_requested=true;
@@ -238,10 +355,12 @@ void lotus_tick(bool scanning,bool *scan_stop_req,bool setting_scan,
                 esp_err_t err=esp_ble_gattc_write_char(client_if,connection_id,write_handle,
                                    LOTUS_FRAME_SIZE,frame.bytes,ESP_GATT_WRITE_TYPE_NO_RSP,ESP_GATT_AUTH_REQ_NONE);
                 if(err==ESP_OK){
+                    lotus_diag_event("GATT write queued",active+1,(int)action);
                     lotus_manager_ack_action(&manager,(size_t)active,action);
                     publish_pending[active]=true;have_state[active]=true;
                     last_tx=now;
                 }else{
+                    lotus_diag_event("GATT write refused",(int)err,active+1);
                     ESP_LOGW(TAG,"FFF3 write refused: %s",esp_err_to_name(err));
                     close_connection();
                 }
@@ -252,6 +371,7 @@ void lotus_tick(bool scanning,bool *scan_stop_req,bool setting_scan,
     }else if(link_state!=L_IDLE && (now-link_since)>
                    ((link_state==L_WAIT_SCAN_STOP)?LOTUS_SCAN_TIMEOUT_MS:
                     (link_state==L_CLOSING?LOTUS_CLOSE_TIMEOUT_MS:LOTUS_OPEN_TIMEOUT_MS))){
+        lotus_diag_event("BLE TIMEOUT",(int)link_state,active+1);
         ESP_LOGW(TAG,"BLE timeout state=%d",(int)link_state);
         if(link_state==L_DISCOVERING||link_state==L_READY) {
             if(active>=0)retry_after[active]=now+5000;
@@ -299,14 +419,20 @@ void lotus_gattc_event(esp_gattc_cb_event_t event,esp_gatt_if_t interface,
                        esp_ble_gattc_cb_param_t *p){
     if(!enabled || !p) return;
     if(event==ESP_GATTC_REG_EVT){
-        if(p->reg.app_id==LOTUS_GATTC_APP_ID && p->reg.status==ESP_GATT_OK){
-            client_if=interface;ESP_LOGI(TAG,"GATTC registered: %u",(unsigned)interface);
+        if(p->reg.app_id==LOTUS_GATTC_APP_ID){
+            lotus_diag_event("GATT register event",(int)p->reg.status,(int)interface);
+            if(p->reg.status==ESP_GATT_OK){
+                client_if=interface;ESP_LOGI(TAG,"GATTC registered: %u",(unsigned)interface);
+            }
         }
         return;
     }
     if(client_if==ESP_GATT_IF_NONE || interface!=client_if || !gatt_events)return;
     lotus_gatt_event_t ev={.event=event,.interface=interface,.param=*p};
-    if(xQueueSend(gatt_events,&ev,0)!=pdTRUE)event_queue_overflow=true;
+    if(xQueueSend(gatt_events,&ev,0)!=pdTRUE){
+        lotus_diag_event("BLE event queue full",(int)event,0);
+        event_queue_overflow=true;
+    }
 }
 
 static void lotus_process_gatt_event(esp_gattc_cb_event_t event,esp_gatt_if_t interface,
@@ -317,8 +443,13 @@ static void lotus_process_gatt_event(esp_gattc_cb_event_t event,esp_gatt_if_t in
             if(p->open.status==ESP_GATT_OK)esp_ble_gattc_close(client_if,p->open.conn_id);
             break;
         }
-        if(p->open.status!=ESP_GATT_OK){ESP_LOGW(TAG,"Open failed %d",p->open.status);fail_connection();break;}
+        if(p->open.status!=ESP_GATT_OK){
+            lotus_diag_event("GATT open failed",(int)p->open.status,0);
+            ESP_LOGW(TAG,"Open failed %d",p->open.status);fail_connection();break;
+        }
+        lotus_diag_event("GATT open OK",active+1,(int)p->open.conn_id);
         connection_id=p->open.conn_id;link_state=L_DISCOVERING;link_since=now_ms();
+        lotus_diag_event("Discover service start",(int)connection_id,0);
         if(esp_ble_gattc_send_mtu_req(client_if,connection_id)!=ESP_OK){
             esp_bt_uuid_t u={.len=ESP_UUID_LEN_16,.uuid.uuid16=0xFFF0};
             esp_ble_gattc_search_service(client_if,connection_id,&u);
@@ -349,8 +480,10 @@ static void lotus_process_gatt_event(esp_gattc_cb_event_t event,esp_gatt_if_t in
                esp_ble_gattc_get_char_by_uuid(client_if,connection_id,start_handle,end_handle,u,&elem,&count)==ESP_GATT_OK && count &&
                (elem.properties & ESP_GATT_CHAR_PROP_BIT_WRITE_NR)){
                 write_handle=elem.char_handle;link_state=L_READY;link_since=now_ms();last_tx=now_ms()-LOTUS_COMMAND_SPACING_MS;
+                lotus_diag_event("FFF3 ready",active+1,rssi_values[active]);
                 ESP_LOGI(TAG,"FFF3 found, slot=%d RSSI=%d",active+1,rssi_values[active]);
             }else{
+                lotus_diag_event("FFF3 NOT FOUND",(int)p->search_cmpl.status,0);
                 ESP_LOGW(TAG,"FFF0/FFF3 write-no-response not found");
                 if(active>=0)retry_after[active]=now_ms()+10000;
                 close_connection();
@@ -359,11 +492,13 @@ static void lotus_process_gatt_event(esp_gattc_cb_event_t event,esp_gatt_if_t in
         break;
     case ESP_GATTC_WRITE_CHAR_EVT:
         if((link_state==L_READY||link_state==L_CLOSING) && p->write.conn_id==connection_id && p->write.status!=ESP_GATT_OK){
+            lotus_diag_event("GATT write event error",(int)p->write.status,0);
             ESP_LOGW(TAG,"BLE write event status=%u",(unsigned)p->write.status);
         }
         break;
     case ESP_GATTC_DISCONNECT_EVT:
         if(active>=0 && !memcmp(p->disconnect.remote_bda,manager.light[active].mac,6)){
+            lotus_diag_event("GATT disconnected",(int)p->disconnect.reason,active+1);
             reset_connection();
         }
         break;
@@ -416,6 +551,13 @@ static void mac_text(int slot,char out[18]){
     snprintf(out,18,"%02X:%02X:%02X:%02X:%02X:%02X",m[0],m[1],m[2],m[3],m[4],m[5]);
 }
 esp_err_t lotus_http_get(httpd_req_t *req){
+    char query[64]={0};
+    if(httpd_req_get_url_query_str(req,query,sizeof(query))==ESP_OK && strstr(query,"log=1")) {
+        httpd_resp_set_type(req,"text/plain; charset=utf-8");
+        httpd_resp_set_hdr(req,"Cache-Control","no-store, no-cache, must-revalidate");
+        lotus_diag_render(req,false);
+        return httpd_resp_sendstr_chunk(req,NULL);
+    }
     char macs[LOTUS_MAX_LIGHTS][18];
     int rssis[LOTUS_MAX_LIGHTS];
     int64_t ages[LOTUS_MAX_LIGHTS];
@@ -430,7 +572,8 @@ esp_err_t lotus_http_get(httpd_req_t *req){
     int64_t remaining=trial_mode?(trial_ends_ms-tm)/1000:0;
     give();
     httpd_resp_set_type(req,"text/html; charset=utf-8");
-    httpd_resp_sendstr_chunk(req,"<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Lotus Lantern v2</title><style>body{font:16px system-ui;background:#161b22;color:#e6edf3;max-width:760px;margin:25px auto;padding:12px}input,select{font-size:1rem;padding:12px;background:#fff;border:0;border-radius:7px;max-width:230px}label{display:block;margin:18px 0}button{background:#238636;color:#fff;border:0;border-radius:7px;padding:12px 20px}a{color:#58a6ff}.warn{color:#ffb86c}</style></head><body><h1>Lotus Lantern v2</h1><p>Five BLE strip slots. Thermometers use the original scanner. BLE control is <b>OFF by default</b>.</p>");
+    httpd_resp_set_hdr(req,"Cache-Control","no-store, no-cache, must-revalidate");
+    httpd_resp_sendstr_chunk(req,"<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Lotus Lantern v3</title><style>body{font:16px system-ui;background:#161b22;color:#e6edf3;max-width:760px;margin:25px auto;padding:12px}input,select{font-size:1rem;padding:12px;background:#fff;border:0;border-radius:7px;max-width:230px}label{display:block;margin:18px 0}button{background:#238636;color:#fff;border:0;border-radius:7px;padding:12px 20px}a{color:#58a6ff}.warn{color:#ffb86c}</style></head><body><h1>Lotus Lantern v3</h1><p>Five BLE strip slots. Thermometers use the original scanner. BLE control is <b>OFF by default</b>.</p>");
     char status[240];
     snprintf(status,sizeof(status),"<p><b>Status: %s</b>%s%lld%s. Free heap: %"PRIu32" bytes.</p>",
              active?(is_trial?"TRIAL":"ENABLED"):"DISABLED",
@@ -444,7 +587,14 @@ esp_err_t lotus_http_get(httpd_req_t *req){
                  i+1,i,macs[i],rssis[i],(long long)ages[i]);
         httpd_resp_sendstr_chunk(req,b);
     }
-    httpd_resp_sendstr_chunk(req,"<p>Unknown ELK-BLEDDM protocol has not been verified. Leave its MAC empty.</p><label>Mode: <select name='mode'><option value='off'>OFF (safest, default)</option><option value='trial'>TEST for 2 minutes, then auto-restart OFF</option><option value='on'>ALWAYS ON (only after successful test)</option></select></label><p class='warn'>Test mode is disarmed BEFORE BLE starts. A crash or reset will return to OFF. All save operations restart the ESP32.</p><button type='submit'>Save and reboot</button></form><p><a href='/'>Back to r4sGate</a></p></body></html>");
+    httpd_resp_sendstr_chunk(req,"<p>Unknown ELK-BLEDDM protocol has not been verified. Leave its MAC empty.</p><label>Mode: <select name='mode'>");
+    httpd_resp_sendstr_chunk(req,active ? (is_trial ?
+            "<option value='off'>OFF (safest)</option><option value='trial' selected>TEST for 2 minutes</option><option value='on'>ALWAYS ON</option>" :
+            "<option value='off'>OFF (safest)</option><option value='trial'>TEST for 2 minutes</option><option value='on' selected>ALWAYS ON</option>") :
+            "<option value='off' selected>OFF (safest)</option><option value='trial'>TEST for 2 minutes</option><option value='on'>ALWAYS ON</option>");
+    httpd_resp_sendstr_chunk(req,"</select></label><p class='warn'>Test mode is disarmed BEFORE BLE starts. A crash or reset will return to OFF. All save operations restart the ESP32.</p><button type='submit'>Save and reboot</button></form>");
+    lotus_diag_render(req,true);
+    httpd_resp_sendstr_chunk(req,"<p><a href='/'>Back to r4sGate</a></p></body></html>");
     return httpd_resp_sendstr_chunk(req,NULL);
 }
 static int fromhex(char c){if(c>='0'&&c<='9')return c-'0';if(c>='a'&&c<='f')return c-'a'+10;if(c>='A'&&c<='F')return c-'A'+10;return -1;}
@@ -501,6 +651,7 @@ esp_err_t lotus_http_post(httpd_req_t *req){
     if(ret==ESP_OK && nvs_set_u8(h,"mode",!strcmp(mode,"on")?1:0)!=ESP_OK)ret=ESP_FAIL;
     if(ret==ESP_OK && nvs_set_u8(h,"trial",!strcmp(mode,"trial")?1:0)!=ESP_OK)ret=ESP_FAIL;
     if(ret==ESP_OK)ret=nvs_commit(h);
+    lotus_diag_event("WEB saved config",!strcmp(mode,"trial")?1:(!strcmp(mode,"on")?2:0),(int)ret);
     nvs_close(h);
     if(ret!=ESP_OK){httpd_resp_send_err(req,HTTPD_500_INTERNAL_SERVER_ERROR,"NVS write failed");return ESP_FAIL;}
     httpd_resp_set_status(req,"303 See Other");
@@ -511,6 +662,8 @@ esp_err_t lotus_http_post(httpd_req_t *req){
 }
 bool lotus_restart_due(void){
     /* Failed networks cannot leave test mode stuck ON forever. */
-    return (restart_requested && now_ms()>restart_at) ||
-           (trial_mode && trial_ends_ms>0 && now_ms()>trial_ends_ms);
+    bool due=(restart_requested && now_ms()>restart_at) ||
+             (trial_mode && trial_ends_ms>0 && now_ms()>trial_ends_ms);
+    if(due) lotus_diag_event("Planned ESP restart",trial_mode,0);
+    return due;
 }
